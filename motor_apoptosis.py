@@ -686,9 +686,9 @@ class ProcesadorTirillas:
     @staticmethod
     def detectar_manchas_auto(
         imagen_procesada: np.ndarray,
-        area_min: int = 50,
+        area_min: int = 10,
         area_max: int = 50000,
-        circularidad_min: float = 0.3,
+        circularidad_min: float = 0.1,
         metodo_umbral: str = 'otsu'
     ) -> List[Dict]:
         """
@@ -856,10 +856,11 @@ class ProcesadorTirillas:
 
     def detectar_y_extraer(
         self,
-        area_min: int = 50,
+        area_min: int = 10,
         area_max: int = 50000,
-        circularidad_min: float = 0.3,
-        metodo_umbral: str = 'otsu'
+        circularidad_min: float = 0.1,
+        metodo_umbral: str = 'otsu',
+        ruta_debug: Optional[str] = None
     ) -> Tuple[Dict[str, Optional[float]], List[Dict], np.ndarray]:
         """
         Pipeline completo que reemplaza el flujo manual de:
@@ -871,13 +872,17 @@ class ProcesadorTirillas:
             3. Invierte.
             4. Detecta manchas automáticamente (Otsu + contornos).
             5. Extrae intensidades de las manchas detectadas.
-            6. Retorna datos estructurados listos para AnalizadorApoptosis.
+            6. (Opcional) Guarda imagen debug con los spots marcados.
+            7. Retorna datos estructurados listos para AnalizadorApoptosis.
 
         Args:
             area_min: Área mínima de mancha válida (px²).
             area_max: Área máxima de mancha válida (px²).
             circularidad_min: Circularidad mínima (0.0-1.0).
             metodo_umbral: 'otsu' o 'adaptativo'.
+            ruta_debug: Si se proporciona, guarda una imagen con los spots
+                        detectados marcados (rectángulos verdes + IDs) en
+                        esta ruta. Ejemplo: 'debug_control.png'.
 
         Returns:
             Tupla (intensidades, manchas_info, imagen_procesada):
@@ -913,7 +918,69 @@ class ProcesadorTirillas:
             f"{max(intensidades.values(), default=0):.1f}]"
         )
 
+        # ── Modo Debug Visual ──
+        if ruta_debug:
+            self._guardar_debug(imagen_procesada, manchas, ruta_debug)
+
         return intensidades, manchas, imagen_procesada
+
+    def _guardar_debug(
+        self,
+        imagen_procesada: np.ndarray,
+        manchas: List[Dict],
+        ruta_salida: str
+    ):
+        """
+        Guarda una imagen de debug con los spots detectados marcados.
+
+        Dibuja sobre la imagen procesada:
+        - Rectángulos verdes alrededor de cada spot detectado.
+        - ID del spot en la esquina superior izquierda.
+        - Intensidad media como texto debajo del rectángulo.
+        - Resumen de hiperparámetros y estadísticas en la esquina.
+
+        Args:
+            imagen_procesada: Imagen en escala de grises invertida.
+            manchas: Lista de manchas detectadas con metadata.
+            ruta_salida: Ruta donde guardar la imagen debug.
+        """
+        # Convertir a color para dibujar en verde/rojo
+        debug_img = cv2.cvtColor(imagen_procesada, cv2.COLOR_GRAY2BGR)
+
+        for mancha in manchas:
+            x, y, w, h = mancha['bbox']
+            spot_id = mancha.get('id', '?')
+            intensidad = mancha['intensidad_media']
+            circ = mancha['circularidad']
+
+            # Rectángulo verde alrededor del spot
+            cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # ID del spot (esquina superior izquierda, fondo negro)
+            label = f"#{spot_id}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            cv2.rectangle(debug_img, (x, y - th - 6), (x + tw + 4, y), (0, 0, 0), -1)
+            cv2.putText(debug_img, label, (x + 2, y - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+            # Intensidad y circularidad debajo del rectángulo
+            info = f"I={intensidad:.0f} C={circ:.2f}"
+            cv2.putText(debug_img, info, (x, y + h + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
+
+        # Resumen en esquina superior derecha
+        alto_img, ancho_img = debug_img.shape[:2]
+        resumen_lines = [
+            f"Spots: {len(manchas)}",
+            f"Imagen: {os.path.basename(self.ruta_imagen)}",
+            f"Dim: {ancho_img}x{alto_img}",
+        ]
+        for i, line in enumerate(resumen_lines):
+            cv2.putText(debug_img, line, (10, 20 + i * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.imwrite(ruta_salida, debug_img)
+        logger.info(f"Imagen debug guardada: {ruta_salida} ({len(manchas)} spots marcados)")
 
     # -------------------------------------------------------------------------
     # Extracción manual (retrocompatibilidad con cuadrícula estática)

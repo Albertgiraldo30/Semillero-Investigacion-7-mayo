@@ -159,8 +159,13 @@ class AplicacionApoptosis(ctk.CTk):
             self.textbox_resultados.insert(ctk.END, "-> Detectando manchas automáticamente (Otsu + contornos)...\n")
             self.update()
 
-            datos_ctrl, manchas_ctrl, _ = procesador_control.detectar_y_extraer()
-            datos_exp, manchas_exp, _ = procesador_experimento.detectar_y_extraer()
+            # Directorio del proyecto para guardar imágenes debug
+            dir_proyecto = os.path.dirname(self.ruta_control)
+            debug_ctrl = os.path.join(dir_proyecto, "debug_control.png")
+            debug_trat = os.path.join(dir_proyecto, "debug_tratamiento.png")
+
+            datos_ctrl, manchas_ctrl, _ = procesador_control.detectar_y_extraer(ruta_debug=debug_ctrl)
+            datos_exp, manchas_exp, _ = procesador_experimento.detectar_y_extraer(ruta_debug=debug_trat)
 
             # Mostrar estadísticas de detección
             self.textbox_resultados.insert(ctk.END, f"\n   [Control]     Spots detectados: {len(manchas_ctrl)}\n")
