@@ -144,63 +144,71 @@ class AplicacionApoptosis(ctk.CTk):
         # Limpiar la caja de texto antes de una nueva corrida
         self.textbox_resultados.delete("1.0", ctk.END)
         self.textbox_resultados.insert(ctk.END, "Iniciando análisis de densitometría...\n\n")
-        self.update() # Refrescar la GUI para que el usuario vea el mensaje
+        self.update()
 
         # 2. Bloque Try-Except global para evitar que la aplicación 'crashee'
         try:
-            # Diccionario Teórico (Ejemplo estático para este proyecto académico)
-            # A futuro, esto puede venir de un archivo Excel .csv seleccionable
-            cuadricula_teorica = {
-                'Reference_1': (10,  10, 15, 15),
-                'Reference_2': (30,  10, 15, 15),
-                'Bax':         (100, 200, 20, 20),
-                'Caspase-3':   (150, 200, 20, 20),
-                'Bcl-2':       (10,  10, 20, 20),
-                'Bad':         (50,  50, 20, 20),
-            }
-            REFERENCIAS = ['Reference_1', 'Reference_2']
-
-            # Instanciación de Clases
+            # ── PASO 1: Instanciar procesadores ──
             self.textbox_resultados.insert(ctk.END, "-> Cargando imágenes en Motor OpenCV...\n")
+            self.update()
             procesador_control = ProcesadorTirillas(self.ruta_control)
             procesador_experimento = ProcesadorTirillas(self.ruta_tratamiento)
 
-            # Preprocesamiento (Alineación con Canny/Perspectiva y Bitwise Not)
-            self.textbox_resultados.insert(ctk.END, "-> Alineando perspectivas e invirtiendo matrices de grises...\n")
-            img_control = procesador_control.preprocesar_imagen()
-            img_experimento = procesador_experimento.preprocesar_imagen()
+            # ── PASO 2: Pipeline Auto-ROI (denoising + CLAHE + Otsu + contornos) ──
+            self.textbox_resultados.insert(ctk.END, "-> Mejorando imagen (denoising + CLAHE)...\n")
+            self.textbox_resultados.insert(ctk.END, "-> Detectando manchas automáticamente (Otsu + contornos)...\n")
+            self.update()
 
-            # Extracción de ROI's
-            self.textbox_resultados.insert(ctk.END, "-> Extrayendo intensidades luminosas...\n")
-            datos_ctrl = procesador_control.extraer_intensidad_puntos(img_control, cuadricula_teorica)
-            datos_exp = procesador_experimento.extraer_intensidad_puntos(img_experimento, cuadricula_teorica)
+            datos_ctrl, manchas_ctrl, _ = procesador_control.detectar_y_extraer()
+            datos_exp, manchas_exp, _ = procesador_experimento.detectar_y_extraer()
 
-            # Cálculos de Expresión y Fold Change
+            # Mostrar estadísticas de detección
+            self.textbox_resultados.insert(ctk.END, f"\n   [Control]     Spots detectados: {len(manchas_ctrl)}\n")
+            self.textbox_resultados.insert(ctk.END, f"   [Tratamiento] Spots detectados: {len(manchas_exp)}\n\n")
+            self.update()
+
+            if not datos_ctrl or not datos_exp:
+                self.textbox_resultados.insert(ctk.END, 
+                    "[!] ADVERTENCIA: No se detectaron manchas en una o ambas imágenes.\n"
+                    "    Verifique que las imágenes sean de membranas del Proteome Profiler.\n"
+                    "    Sugerencias: ajustar contraste de la imagen, o usar imágenes de mayor resolución.\n"
+                )
+                return
+
+            # ── PASO 3: Calcular Fold Change ──
             self.textbox_resultados.insert(ctk.END, "-> Calculando Fold Change y Resumen Clínico...\n\n")
-            analizador = AnalizadorApoptosis(
-                pro_apoptoticas=['Bax', 'Caspase-3', 'Bad'],
-                anti_apoptoticas=['Bcl-2']
-            )
+            self.update()
 
-            ctrl_norm = analizador.normalizar_por_referencia(datos_ctrl, REFERENCIAS)
-            exp_norm = analizador.normalizar_por_referencia(datos_exp, REFERENCIAS)
+            # Usar todos los spots detectados como proteínas no clasificadas
+            # (se clasificarán cuando se mapeen a las posiciones del array ARY009)
+            analizador = AnalizadorApoptosis()
+            reporte_cientifico = analizador.calcular_fold_change(datos_ctrl, datos_exp)
 
-            reporte_cientifico = analizador.calcular_fold_change(ctrl_norm, exp_norm)
-
-            # 3. Presentación de los resultados estructurados
+            # ── PASO 4: Presentación de resultados ──
             texto_json = json.dumps(reporte_cientifico, indent=4, ensure_ascii=False)
             
             self.textbox_resultados.insert(ctk.END, "================ REPORTE CIENTÍFICO ================\n")
             self.textbox_resultados.insert(ctk.END, texto_json)
-            self.textbox_resultados.insert(ctk.END, "\n====================================================")
+            self.textbox_resultados.insert(ctk.END, "\n====================================================\n\n")
+            
+            # Resumen de spots detectados para debug
+            self.textbox_resultados.insert(ctk.END, "──── DETALLE DE SPOTS DETECTADOS ────\n")
+            self.textbox_resultados.insert(ctk.END, f"{'Spot':<10} {'Intensidad Ctrl':>15} {'Intensidad Trat':>15} {'Fold':>8}\n")
+            self.textbox_resultados.insert(ctk.END, "─" * 50 + "\n")
+            
+            for nombre in sorted(set(datos_ctrl.keys()) | set(datos_exp.keys())):
+                val_c = datos_ctrl.get(nombre, 0)
+                val_e = datos_exp.get(nombre, 0)
+                if val_c and val_c > 1.0:
+                    fold = round(val_e / val_c, 2) if val_e else 0.0
+                else:
+                    fold = "∞" if val_e else "-"
+                self.textbox_resultados.insert(ctk.END, f"{nombre:<10} {val_c:>15.2f} {val_e:>15.2f} {str(fold):>8}\n")
             
         except Exception as e:
-            # Si ocurre cualquier error geométrico, lectura, dict key error, lo capturamos aquí
             error_mensaje = traceback.format_exc()
             self.textbox_resultados.insert(ctk.END, "\n[X] Ocurrió un error inesperado durante el análisis:\n\n")
             self.textbox_resultados.insert(ctk.END, error_mensaje)
-            
-            # También mostramos una alerta visual invasiva para asegurarnos que el usuario lo note
             messagebox.showerror("Error en Análisis", f"Revise el Textbox para leer la traza completa.\nError: {str(e)}")
 
 

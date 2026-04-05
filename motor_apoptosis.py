@@ -599,23 +599,325 @@ class ProcesadorTirillas:
 
     def preprocesar_imagen(self) -> np.ndarray:
         """
-        Lee la imagen (WSI o estándar), alinea la membrana, convierte a escala
-        de grises e invierte.
+        Lee la imagen (WSI o estándar), alinea la membrana, aplica mejora
+        de imagen (denoising + CLAHE), convierte a escala de grises e invierte.
 
-        La inversión es necesaria porque en la membrana original los puntos de
-        proteína aparecen oscuros sobre fondo claro. Al invertir, el fondo queda
-        en 0 (negro) y los puntos en valores altos (blancos), de modo que la
-        intensidad promedio de un ROI es directamente proporcional a la
-        concentración de proteína.
+        Pipeline completo:
+            1. Cargar imagen (cv2 o OpenSlide según extensión)
+            2. Alinear perspectiva de la membrana
+            3. Reducir ruido (fastNlMeansDenoising)
+            4. Mejorar contraste (CLAHE)
+            5. Invertir (fondo=0, proteínas=valores altos)
 
         Returns:
-            Imagen en escala de grises invertida (numpy array uint8).
+            Imagen en escala de grises mejorada e invertida (numpy array uint8).
         """
         imagen = self._cargar_imagen()
         imagen_alineada = self.alinear_tirilla(imagen)
         imagen_gris = cv2.cvtColor(imagen_alineada, cv2.COLOR_BGR2GRAY)
-        imagen_invertida = cv2.bitwise_not(imagen_gris)
+
+        # ── Paso de mejora: reducir ruido + contrastar ──
+        imagen_mejorada = self.mejorar_imagen(imagen_gris)
+
+        imagen_invertida = cv2.bitwise_not(imagen_mejorada)
         return imagen_invertida
+
+    # -------------------------------------------------------------------------
+    # Image Enhancement (Denoising + Contraste)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def mejorar_imagen(
+        imagen_gris: np.ndarray,
+        fuerza_denoising: int = 10,
+        clip_limit_clahe: float = 3.0,
+        tile_grid_clahe: Tuple[int, int] = (8, 8)
+    ) -> np.ndarray:
+        """
+        Aplica reducción de ruido y mejora de contraste sobre una imagen
+        en escala de grises.
+
+        Pipeline:
+            1. fastNlMeansDenoising: Filtro no-local que preserva bordes
+               mientras elimina ruido granulado (superior a GaussianBlur para
+               imágenes de microscopía con texturas detalladas).
+            2. CLAHE (Contrast Limited Adaptive Histogram Equalization):
+               Mejora el contraste local sin saturar regiones ya brillantes.
+               A diferencia de equalizeHist() global, CLAHE trabaja por tiles
+               para manejar iluminación no uniforme de la membrana.
+
+        Args:
+            imagen_gris: Imagen en escala de grises (uint8).
+            fuerza_denoising: Intensidad del filtro de ruido (5-15 recomendado).
+                              Mayor = más suave pero pierde detalle fino.
+            clip_limit_clahe: Límite de recorte del histograma CLAHE (2.0-4.0).
+                              Mayor = más contraste pero puede amplificar ruido.
+            tile_grid_clahe: Tamaño de la grilla de tiles para CLAHE.
+
+        Returns:
+            Imagen mejorada (escala de grises, uint8).
+        """
+        # Paso 1: Reducción de ruido no-local
+        imagen_denoised = cv2.fastNlMeansDenoising(
+            imagen_gris,
+            h=fuerza_denoising,
+            templateWindowSize=7,
+            searchWindowSize=21
+        )
+
+        # Paso 2: Mejora de contraste adaptativa local (CLAHE)
+        clahe = cv2.createCLAHE(
+            clipLimit=clip_limit_clahe,
+            tileGridSize=tile_grid_clahe
+        )
+        imagen_contrastada = clahe.apply(imagen_denoised)
+
+        logger.info(
+            f"Imagen mejorada: denoising(h={fuerza_denoising}), "
+            f"CLAHE(clip={clip_limit_clahe}, grid={tile_grid_clahe})"
+        )
+
+        return imagen_contrastada
+
+    # -------------------------------------------------------------------------
+    # Detección automática de manchas (Auto-ROI)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def detectar_manchas_auto(
+        imagen_procesada: np.ndarray,
+        area_min: int = 50,
+        area_max: int = 50000,
+        circularidad_min: float = 0.3,
+        metodo_umbral: str = 'otsu'
+    ) -> List[Dict]:
+        """
+        Detecta automáticamente las manchas de proteína en la membrana
+        usando umbralización + detección de contornos. Elimina por completo
+        la necesidad de coordenadas hardcodeadas.
+
+        Pipeline:
+            1. Umbralización (Otsu o Adaptativo) para binarizar la imagen.
+            2. Operaciones morfológicas para limpiar ruido residual.
+            3. findContours para extraer los blobs (manchas).
+            4. Filtrado por área y circularidad para descartar artefactos.
+            5. Ordenamiento espacial (top→bottom, left→right) para
+               asignación consistente a las posiciones del array.
+
+        Args:
+            imagen_procesada: Imagen en escala de grises invertida (las manchas
+                               aparecen como regiones brillantes).
+            area_min: Área mínima en px² para considerar un contorno como
+                      mancha válida. Elimina ruido puntual.
+            area_max: Área máxima en px² para descartar contornos que son
+                      la membrana completa o artefactos grandes.
+            circularidad_min: Circularidad mínima (0.0-1.0) para filtrar.
+                              Las manchas del array son circulares (~0.5-0.9).
+                              Artefactos lineales tienen circularidad baja.
+            metodo_umbral: 'otsu' para Otsu global, 'adaptativo' para
+                           umbralización adaptativa (mejor para iluminación
+                           no uniforme).
+
+        Returns:
+            Lista de diccionarios, uno por mancha detectada, ordenados
+            espacialmente de arriba-izq a abajo-der:
+            [
+                {
+                    'id': int,
+                    'bbox': (x, y, w, h),
+                    'centro': (cx, cy),
+                    'area': float,
+                    'circularidad': float,
+                    'intensidad_media': float,
+                    'intensidad_max': float,
+                },
+                ...
+            ]
+        """
+        # ── Paso 1: Umbralización ──
+        if metodo_umbral == 'adaptativo':
+            binaria = cv2.adaptiveThreshold(
+                imagen_procesada, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                blockSize=31,
+                C=-5
+            )
+        else:
+            # Otsu: calcula automáticamente el umbral óptimo
+            umbral_otsu, binaria = cv2.threshold(
+                imagen_procesada, 0, 255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            logger.info(f"Umbral Otsu calculado automáticamente: {umbral_otsu:.0f}")
+
+        # ── Paso 2: Operaciones morfológicas para limpiar ruido ──
+        kernel_apertura = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        kernel_cierre = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+        # Opening: elimina ruido puntual pequeño
+        binaria = cv2.morphologyEx(binaria, cv2.MORPH_OPEN, kernel_apertura, iterations=2)
+        # Closing: cierra huecos dentro de las manchas
+        binaria = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, kernel_cierre, iterations=2)
+
+        # ── Paso 3: Detectar contornos ──
+        contornos, _ = cv2.findContours(
+            binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        logger.info(f"Contornos detectados (sin filtrar): {len(contornos)}")
+
+        # ── Paso 4: Filtrar por área y circularidad ──
+        manchas = []
+        for contorno in contornos:
+            area = cv2.contourArea(contorno)
+
+            # Filtro de área
+            if area < area_min or area > area_max:
+                continue
+
+            # Filtro de circularidad: 4π·Área / Perímetro²
+            perimetro = cv2.arcLength(contorno, True)
+            if perimetro == 0:
+                continue
+            circularidad = (4.0 * np.pi * area) / (perimetro * perimetro)
+
+            if circularidad < circularidad_min:
+                continue
+
+            # Calcular bounding box y centro
+            x, y, w, h = cv2.boundingRect(contorno)
+            momentos = cv2.moments(contorno)
+            if momentos['m00'] > 0:
+                cx = int(momentos['m10'] / momentos['m00'])
+                cy = int(momentos['m01'] / momentos['m00'])
+            else:
+                cx, cy = x + w // 2, y + h // 2
+
+            # Medir intensidad dentro del contorno (usando máscara del contorno)
+            mascara_contorno = np.zeros(imagen_procesada.shape, dtype=np.uint8)
+            cv2.drawContours(mascara_contorno, [contorno], -1, 255, -1)
+            intensidad_media = cv2.mean(imagen_procesada, mask=mascara_contorno)[0]
+
+            # Intensidad máxima en la región del bounding box
+            roi = imagen_procesada[y:y+h, x:x+w]
+            intensidad_max = float(np.max(roi)) if roi.size > 0 else 0.0
+
+            manchas.append({
+                'bbox': (x, y, w, h),
+                'centro': (cx, cy),
+                'area': round(area, 1),
+                'circularidad': round(circularidad, 3),
+                'intensidad_media': round(intensidad_media, 2),
+                'intensidad_max': round(intensidad_max, 2),
+            })
+
+        # ── Paso 5: Ordenar espacialmente (filas → columnas) ──
+        # Agrupar por filas: manchas con cy similar pertenecen a la misma fila
+        if manchas:
+            manchas.sort(key=lambda m: m['centro'][1])  # Ordenar por Y primero
+
+            # Agrupar en filas usando tolerancia vertical
+            altura_promedio = np.mean([m['bbox'][3] for m in manchas])
+            tolerancia_y = altura_promedio * 1.5
+
+            filas = []
+            fila_actual = [manchas[0]]
+
+            for i in range(1, len(manchas)):
+                if abs(manchas[i]['centro'][1] - fila_actual[0]['centro'][1]) < tolerancia_y:
+                    fila_actual.append(manchas[i])
+                else:
+                    filas.append(sorted(fila_actual, key=lambda m: m['centro'][0]))
+                    fila_actual = [manchas[i]]
+            filas.append(sorted(fila_actual, key=lambda m: m['centro'][0]))
+
+            # Reconstruir lista ordenada y asignar IDs
+            manchas_ordenadas = []
+            idx = 1
+            for fila in filas:
+                for mancha in fila:
+                    mancha['id'] = idx
+                    manchas_ordenadas.append(mancha)
+                    idx += 1
+
+            manchas = manchas_ordenadas
+
+        logger.info(
+            f"Manchas válidas detectadas: {len(manchas)} "
+            f"(filtro: área=[{area_min},{area_max}], circularidad>={circularidad_min})"
+        )
+
+        return manchas
+
+    # -------------------------------------------------------------------------
+    # Pipeline completo: detectar + extraer (reemplazo de la cuadrícula manual)
+    # -------------------------------------------------------------------------
+
+    def detectar_y_extraer(
+        self,
+        area_min: int = 50,
+        area_max: int = 50000,
+        circularidad_min: float = 0.3,
+        metodo_umbral: str = 'otsu'
+    ) -> Tuple[Dict[str, Optional[float]], List[Dict], np.ndarray]:
+        """
+        Pipeline completo que reemplaza el flujo manual de:
+            preprocesar_imagen() → extraer_intensidad_puntos(cuadricula_hardcodeada)
+
+        Este método:
+            1. Carga y alinea la imagen.
+            2. Aplica mejora (denoising + CLAHE).
+            3. Invierte.
+            4. Detecta manchas automáticamente (Otsu + contornos).
+            5. Extrae intensidades de las manchas detectadas.
+            6. Retorna datos estructurados listos para AnalizadorApoptosis.
+
+        Args:
+            area_min: Área mínima de mancha válida (px²).
+            area_max: Área máxima de mancha válida (px²).
+            circularidad_min: Circularidad mínima (0.0-1.0).
+            metodo_umbral: 'otsu' o 'adaptativo'.
+
+        Returns:
+            Tupla (intensidades, manchas_info, imagen_procesada):
+                - intensidades: Dict {f'Spot_{id}': intensidad_media}
+                  listo para pasar a AnalizadorApoptosis.
+                - manchas_info: Lista de dicts con metadata de cada mancha
+                  (bbox, centro, área, circularidad, intensidades).
+                - imagen_procesada: La imagen invertida/mejorada para
+                  visualización o debug.
+        """
+        # Pipeline de preprocesamiento mejorado
+        imagen_procesada = self.preprocesar_imagen()
+
+        # Detección automática de manchas
+        manchas = self.detectar_manchas_auto(
+            imagen_procesada,
+            area_min=area_min,
+            area_max=area_max,
+            circularidad_min=circularidad_min,
+            metodo_umbral=metodo_umbral
+        )
+
+        # Construir diccionario de intensidades con nombres genéricos
+        intensidades = {}
+        for mancha in manchas:
+            nombre = f"Spot_{mancha['id']:02d}"
+            intensidades[nombre] = mancha['intensidad_media']
+
+        logger.info(
+            f"Pipeline Auto-ROI completado: {len(manchas)} spots extraídos. "
+            f"Rango de intensidades: "
+            f"[{min(intensidades.values(), default=0):.1f} - "
+            f"{max(intensidades.values(), default=0):.1f}]"
+        )
+
+        return intensidades, manchas, imagen_procesada
+
+    # -------------------------------------------------------------------------
+    # Extracción manual (retrocompatibilidad con cuadrícula estática)
+    # -------------------------------------------------------------------------
 
     def extraer_intensidad_puntos(
         self,
@@ -625,14 +927,15 @@ class ProcesadorTirillas:
         """
         Extrae la intensidad promedio (0–255) de cada región de interés (ROI).
 
+        NOTA: Este método se mantiene para retrocompatibilidad con cuadrículas
+        manuales. Para detección automática, usar detectar_y_extraer().
+
         Args:
             imagen_procesada: Imagen en escala de grises invertida.
             rois: Diccionario {nombre: (x, y, ancho, alto)}.
 
         Returns:
             Diccionario {nombre: intensidad_promedio} donde None indica ROI inválido.
-            Los ROIs inválidos se reportan como None (no como 0.0) para que el
-            analizador distinga "ausencia real" de "dato no medible".
         """
         alto_imagen, ancho_imagen = imagen_procesada.shape[:2]
         resultados = {}
