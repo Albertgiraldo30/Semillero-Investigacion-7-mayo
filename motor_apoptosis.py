@@ -1,5 +1,6 @@
 """
-motor_apoptosis.py — Motor de análisis de apoptosis con soporte para Leica .SCN (WSI).
+motor_apoptosis.py — Motor de análisis de apoptosis con soporte para Leica .SCN (WSI)
+y normalización automática por Reference Spots.
 
 Integra OpenSlide para lectura eficiente de Whole Slide Images sin saturar la RAM,
 manteniendo retrocompatibilidad total con imágenes estándar (JPG, PNG, BMP, TIFF plano)
@@ -7,6 +8,8 @@ leídas con OpenCV.
 
 Clases:
     ProcesadorTirillas: Procesa imágenes de membranas del Proteome Profiler Array.
+                        Incluye identificación automática de Reference Spots y
+                        normalización de intensidades.
     AnalizadorApoptosis: Calcula Fold Change normalizado por Reference Spots.
     LectorWSI: Lector eficiente de WSI con extracción de tiles bajo demanda.
 
@@ -43,6 +46,11 @@ logger = logging.getLogger('MotorApoptosis')
 
 # Umbral mínimo de intensidad para considerar que una proteína está presente.
 EPSILON_INTENSIDAD = 1.0
+
+# Número de puntos de referencia (Reference Spots) en el Proteome Profiler Array.
+# Estos son controles positivos cargados con anticuerpo saturante. Se activan
+# siempre y se usan para normalizar intensidades entre membranas.
+NUM_REFERENCE_SPOTS = 3
 
 
 # =============================================================================
@@ -851,7 +859,175 @@ class ProcesadorTirillas:
         return manchas
 
     # -------------------------------------------------------------------------
-    # Pipeline completo: detectar + extraer (reemplazo de la cuadrícula manual)
+    # Identificación automática de Reference Spots
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def identificar_spots_referencia(
+        manchas: List[Dict],
+        num_refs: int = NUM_REFERENCE_SPOTS,
+        metodo: str = 'score'
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Identifica automáticamente los puntos de referencia (Reference Spots)
+        del Proteome Profiler Array a partir de los spots ya detectados.
+
+        Fundamento biológico:
+            Los Reference Spots son controles positivos que contienen anticuerpo
+            biotinilado a concentración saturante. Por diseño del kit, estos
+            spots siempre presentan la mayor señal en la membrana,
+            manifestándose como manchas de ALTA intensidad y GRAN área.
+
+        Heurísticas disponibles:
+            - 'score' (por defecto): Selecciona los `num_refs` spots con mayor
+              score = área × intensidad_media. Esto captura la propiedad dual
+              de los Reference Spots (grandes + brillantes) y es robusto ante
+              spots pequeños pero brillantes (artefactos) o grandes pero tenues
+              (manchas de fondo).
+            - 'intensidad': Selecciona los `num_refs` spots con mayor
+              intensidad_media pura. Útil si todos los spots tienen tamaño
+              similar.
+            - 'area': Selecciona los `num_refs` spots con mayor área.
+              Útil si las referencias son marcadamente más grandes.
+
+        Args:
+            manchas: Lista de spots detectados por detectar_manchas_auto().
+            num_refs: Número de Reference Spots a identificar (default: 3).
+            metodo: Criterio de selección: 'score', 'intensidad', o 'area'.
+
+        Returns:
+            Tupla (referencias, muestras):
+                - referencias: Lista de `num_refs` spots identificados como
+                  Reference Spots, ordenados por score descendente.
+                - muestras: Lista de los spots restantes (proteínas a analizar),
+                  manteniendo su orden espacial original.
+
+        Raises:
+            ValueError: Si hay menos spots detectados que `num_refs`.
+        """
+        if len(manchas) < num_refs:
+            raise ValueError(
+                f"Se necesitan al menos {num_refs} spots para identificar referencias, "
+                f"pero solo se detectaron {len(manchas)}. Ajuste los parámetros de "
+                f"detección (area_min, circularidad_min) o revise la imagen."
+            )
+
+        # Calcular score según el método elegido
+        if metodo == 'intensidad':
+            key_fn = lambda m: m['intensidad_media']
+            criterio_log = 'intensidad_media'
+        elif metodo == 'area':
+            key_fn = lambda m: m['area']
+            criterio_log = 'area'
+        else:  # 'score' (por defecto)
+            key_fn = lambda m: m['area'] * m['intensidad_media']
+            criterio_log = 'area × intensidad'
+
+        # Ordenar por score descendente y tomar los top-N como referencias
+        manchas_con_score = sorted(manchas, key=key_fn, reverse=True)
+
+        ids_referencia = set()
+        referencias = []
+        for mancha in manchas_con_score[:num_refs]:
+            mancha_ref = mancha.copy()
+            mancha_ref['es_referencia'] = True
+            mancha_ref['score_referencia'] = round(key_fn(mancha), 2)
+            referencias.append(mancha_ref)
+            ids_referencia.add(mancha['id'])
+
+        # Las muestras son todos los spots que NO son referencia
+        muestras = [m for m in manchas if m['id'] not in ids_referencia]
+
+        # Log detallado
+        logger.info(
+            f"Reference Spots identificados (método='{metodo}', criterio={criterio_log}):"
+        )
+        for ref in referencias:
+            logger.info(
+                f"  → Spot #{ref['id']}: intensidad={ref['intensidad_media']:.2f}, "
+                f"área={ref['area']}, score={ref['score_referencia']}"
+            )
+        logger.info(
+            f"Spots de muestra restantes: {len(muestras)}"
+        )
+
+        return referencias, muestras
+
+    # -------------------------------------------------------------------------
+    # Normalización de intensidades por Reference Spots
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def normalizar_intensidades_por_referencia(
+        manchas: List[Dict],
+        referencias: List[Dict]
+    ) -> Tuple[Dict[str, float], float]:
+        """
+        Normaliza las intensidades de los spots de muestra dividiéndolas por el
+        promedio de intensidad de los Reference Spots.
+
+        Fórmula:
+            promedio_ref = mean(intensidad_media de cada Reference Spot)
+            Intensidad_Relativa_i = intensidad_media_i / promedio_ref
+
+        Esto produce valores adimensionales donde:
+            - 1.0 = misma intensidad que las referencias
+            - >1.0 = señal más fuerte que las referencias (raro en la práctica)
+            - <1.0 = señal más débil que las referencias (lo normal)
+            - ~0.0 = proteína ausente o no expresada
+
+        La normalización elimina variabilidad técnica entre membranas:
+            - Diferentes tiempos de exposición al quimioluminiscente
+            - Diferente cantidad de lisado celular cargado
+            - Variaciones lote a lote de reactivos
+
+        Args:
+            manchas: Lista de spots de muestra (ya sin las referencias).
+            referencias: Lista de Reference Spots identificados.
+
+        Returns:
+            Tupla (intensidades_normalizadas, promedio_ref):
+                - intensidades_normalizadas: Dict {f'Spot_{id}': intensidad_relativa}
+                - promedio_ref: El valor del promedio de referencia utilizado.
+
+        Raises:
+            ValueError: Si el promedio de referencia es <= 0 (referencias inválidas).
+        """
+        # Calcular promedio de referencia
+        valores_ref = [r['intensidad_media'] for r in referencias]
+        promedio_ref = float(np.mean(valores_ref))
+
+        logger.info(
+            f"Intensidades de referencia: {[round(v, 2) for v in valores_ref]}"
+        )
+        logger.info(
+            f"Promedio de referencia (promedio_ref): {promedio_ref:.4f}"
+        )
+
+        if promedio_ref <= EPSILON_INTENSIDAD:
+            raise ValueError(
+                f"El promedio de referencia ({promedio_ref:.4f}) es <= {EPSILON_INTENSIDAD}. "
+                f"Las referencias pueden estar mal identificadas o la imagen no tiene señal."
+            )
+
+        # Normalizar cada spot de muestra
+        intensidades_normalizadas = {}
+        for mancha in manchas:
+            nombre = f"Spot_{mancha['id']:02d}"
+            intensidad_relativa = mancha['intensidad_media'] / promedio_ref
+            intensidades_normalizadas[nombre] = round(intensidad_relativa, 6)
+
+        logger.info(
+            f"Normalización completada: {len(intensidades_normalizadas)} spots normalizados. "
+            f"Rango relativo: "
+            f"[{min(intensidades_normalizadas.values(), default=0):.4f} - "
+            f"{max(intensidades_normalizadas.values(), default=0):.4f}]"
+        )
+
+        return intensidades_normalizadas, promedio_ref
+
+    # -------------------------------------------------------------------------
+    # Pipeline completo: detectar + extraer + normalizar por referencia
     # -------------------------------------------------------------------------
 
     def detectar_y_extraer(
@@ -860,44 +1036,51 @@ class ProcesadorTirillas:
         area_max: int = 50000,
         circularidad_min: float = 0.1,
         metodo_umbral: str = 'otsu',
+        num_refs: int = NUM_REFERENCE_SPOTS,
+        metodo_referencia: str = 'score',
         ruta_debug: Optional[str] = None
-    ) -> Tuple[Dict[str, Optional[float]], List[Dict], np.ndarray]:
+    ) -> Tuple[Dict[str, float], Dict[str, float], List[Dict], List[Dict], np.ndarray, float]:
         """
-        Pipeline completo que reemplaza el flujo manual de:
-            preprocesar_imagen() → extraer_intensidad_puntos(cuadricula_hardcodeada)
+        Pipeline completo con normalización automática por Reference Spots.
 
-        Este método:
+        Reemplaza el flujo manual de:
+            preprocesar → extraer → normalizar manualmente
+
+        Pipeline:
             1. Carga y alinea la imagen.
-            2. Aplica mejora (denoising + CLAHE).
-            3. Invierte.
-            4. Detecta manchas automáticamente (Otsu + contornos).
-            5. Extrae intensidades de las manchas detectadas.
-            6. (Opcional) Guarda imagen debug con los spots marcados.
-            7. Retorna datos estructurados listos para AnalizadorApoptosis.
+            2. Aplica mejora (denoising + CLAHE) + inversión.
+            3. Detecta manchas automáticamente (Otsu + contornos).
+            4. **Identifica los 3 Reference Spots** (mayor score área×intensidad).
+            5. **Calcula promedio_ref** = mean(intensidad de las 3 referencias).
+            6. **Normaliza** todas las intensidades de muestra: valor / promedio_ref.
+            7. (Opcional) Guarda imagen debug con referencias en rojo y muestras en verde.
+            8. Retorna intensidades crudas, normalizadas y metadata.
 
         Args:
             area_min: Área mínima de mancha válida (px²).
             area_max: Área máxima de mancha válida (px²).
             circularidad_min: Circularidad mínima (0.0-1.0).
             metodo_umbral: 'otsu' o 'adaptativo'.
-            ruta_debug: Si se proporciona, guarda una imagen con los spots
-                        detectados marcados (rectángulos verdes + IDs) en
-                        esta ruta. Ejemplo: 'debug_control.png'.
+            num_refs: Número de Reference Spots a identificar (default: 3).
+            metodo_referencia: Criterio para identificar referencias:
+                'score' (área×intensidad), 'intensidad', o 'area'.
+            ruta_debug: Ruta para guardar imagen debug con spots marcados.
 
         Returns:
-            Tupla (intensidades, manchas_info, imagen_procesada):
-                - intensidades: Dict {f'Spot_{id}': intensidad_media}
-                  listo para pasar a AnalizadorApoptosis.
-                - manchas_info: Lista de dicts con metadata de cada mancha
-                  (bbox, centro, área, circularidad, intensidades).
-                - imagen_procesada: La imagen invertida/mejorada para
-                  visualización o debug.
+            Tupla de 6 elementos:
+                - intensidades_crudas: Dict {f'Spot_{id}': intensidad_media_bruta}
+                  para todos los spots de muestra (sin referencias).
+                - intensidades_normalizadas: Dict {f'Spot_{id}': intensidad_relativa}
+                  donde intensidad_relativa = bruta / promedio_ref.
+                - manchas_muestra: Lista de dicts de spots de muestra.
+                - manchas_referencia: Lista de dicts de Reference Spots.
+                - imagen_procesada: Imagen invertida/mejorada.
+                - promedio_ref: Valor del promedio de referencia utilizado.
         """
-        # Pipeline de preprocesamiento mejorado
+        # ── Paso 1-3: Preprocesamiento + detección ──
         imagen_procesada = self.preprocesar_imagen()
 
-        # Detección automática de manchas
-        manchas = self.detectar_manchas_auto(
+        todas_manchas = self.detectar_manchas_auto(
             imagen_procesada,
             area_min=area_min,
             area_max=area_max,
@@ -905,48 +1088,98 @@ class ProcesadorTirillas:
             metodo_umbral=metodo_umbral
         )
 
-        # Construir diccionario de intensidades con nombres genéricos
-        intensidades = {}
-        for mancha in manchas:
+        # ── Paso 4: Identificar Reference Spots ──
+        referencias, muestras = self.identificar_spots_referencia(
+            todas_manchas,
+            num_refs=num_refs,
+            metodo=metodo_referencia
+        )
+
+        # ── Paso 5-6: Normalizar por promedio de referencia ──
+        intensidades_normalizadas, promedio_ref = self.normalizar_intensidades_por_referencia(
+            muestras, referencias
+        )
+
+        # Intensidades crudas (solo muestras, sin referencias)
+        intensidades_crudas = {}
+        for mancha in muestras:
             nombre = f"Spot_{mancha['id']:02d}"
-            intensidades[nombre] = mancha['intensidad_media']
+            intensidades_crudas[nombre] = mancha['intensidad_media']
 
         logger.info(
-            f"Pipeline Auto-ROI completado: {len(manchas)} spots extraídos. "
-            f"Rango de intensidades: "
-            f"[{min(intensidades.values(), default=0):.1f} - "
-            f"{max(intensidades.values(), default=0):.1f}]"
+            f"Pipeline Auto-ROI + Normalización completado: "
+            f"{len(muestras)} spots de muestra + {len(referencias)} referencias. "
+            f"promedio_ref={promedio_ref:.4f}. "
+            f"Rango crudo: [{min(intensidades_crudas.values(), default=0):.1f} - "
+            f"{max(intensidades_crudas.values(), default=0):.1f}]. "
+            f"Rango normalizado: [{min(intensidades_normalizadas.values(), default=0):.4f} - "
+            f"{max(intensidades_normalizadas.values(), default=0):.4f}]"
         )
 
         # ── Modo Debug Visual ──
         if ruta_debug:
-            self._guardar_debug(imagen_procesada, manchas, ruta_debug)
+            self._guardar_debug(
+                imagen_procesada, muestras, ruta_debug,
+                referencias=referencias
+            )
 
-        return intensidades, manchas, imagen_procesada
+        return (
+            intensidades_crudas,
+            intensidades_normalizadas,
+            muestras,
+            referencias,
+            imagen_procesada,
+            promedio_ref
+        )
 
     def _guardar_debug(
         self,
         imagen_procesada: np.ndarray,
         manchas: List[Dict],
-        ruta_salida: str
+        ruta_salida: str,
+        referencias: Optional[List[Dict]] = None
     ):
         """
         Guarda una imagen de debug con los spots detectados marcados.
 
         Dibuja sobre la imagen procesada:
-        - Rectángulos verdes alrededor de cada spot detectado.
-        - ID del spot en la esquina superior izquierda.
-        - Intensidad media como texto debajo del rectángulo.
-        - Resumen de hiperparámetros y estadísticas en la esquina.
+        - Rectángulos VERDES para spots de muestra.
+        - Rectángulos ROJOS para Reference Spots (si se proporcionan).
+        - ID del spot, intensidad y circularidad.
+        - Resumen de estadísticas en la esquina.
 
         Args:
             imagen_procesada: Imagen en escala de grises invertida.
-            manchas: Lista de manchas detectadas con metadata.
+            manchas: Lista de manchas de muestra con metadata.
             ruta_salida: Ruta donde guardar la imagen debug.
+            referencias: Lista de Reference Spots (se marcan en rojo).
         """
         # Convertir a color para dibujar en verde/rojo
         debug_img = cv2.cvtColor(imagen_procesada, cv2.COLOR_GRAY2BGR)
 
+        # ── Dibujar Reference Spots en ROJO ──
+        if referencias:
+            for ref in referencias:
+                x, y, w, h = ref['bbox']
+                spot_id = ref.get('id', '?')
+                intensidad = ref['intensidad_media']
+
+                # Rectángulo rojo grueso para distinguir de las muestras
+                cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 0, 255), 3)
+
+                # Etiqueta "REF #id"
+                label = f"REF #{spot_id}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(debug_img, (x, y - th - 8), (x + tw + 6, y), (0, 0, 180), -1)
+                cv2.putText(debug_img, label, (x + 3, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+                # Intensidad debajo del rectángulo
+                info_ref = f"I={intensidad:.0f}"
+                cv2.putText(debug_img, info_ref, (x, y + h + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+
+        # ── Dibujar spots de muestra en VERDE ──
         for mancha in manchas:
             x, y, w, h = mancha['bbox']
             spot_id = mancha.get('id', '?')
@@ -968,19 +1201,27 @@ class ProcesadorTirillas:
             cv2.putText(debug_img, info, (x, y + h + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
 
-        # Resumen en esquina superior derecha
+        # Resumen en la esquina
         alto_img, ancho_img = debug_img.shape[:2]
         resumen_lines = [
-            f"Spots: {len(manchas)}",
+            f"Muestras: {len(manchas)}",
+            f"Referencias: {len(referencias) if referencias else 0}",
             f"Imagen: {os.path.basename(self.ruta_imagen)}",
             f"Dim: {ancho_img}x{alto_img}",
         ]
+        if referencias:
+            promedio_ref = np.mean([r['intensidad_media'] for r in referencias])
+            resumen_lines.append(f"Prom.Ref: {promedio_ref:.2f}")
+
         for i, line in enumerate(resumen_lines):
             cv2.putText(debug_img, line, (10, 20 + i * 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         cv2.imwrite(ruta_salida, debug_img)
-        logger.info(f"Imagen debug guardada: {ruta_salida} ({len(manchas)} spots marcados)")
+        logger.info(
+            f"Imagen debug guardada: {ruta_salida} "
+            f"({len(manchas)} muestras + {len(referencias) if referencias else 0} refs)"
+        )
 
     # -------------------------------------------------------------------------
     # Extracción manual (retrocompatibilidad con cuadrícula estática)
@@ -1040,9 +1281,16 @@ class AnalizadorApoptosis:
     Analizador de resultados del Proteome Profiler Human Apoptosis Array
     usando Densidad Óptica Relativa normalizada (Fold Change).
 
-    El Fold Change se calcula como Tratamiento / Control para cada proteína,
-    normalizado por los Reference Spots del array para eliminar variaciones
-    técnicas entre membranas.
+    El Fold Change se calcula como Tratamiento / Control para cada proteína.
+    Las intensidades DEBEN estar ya normalizadas por Reference Spots
+    (usar ProcesadorTirillas.detectar_y_extraer() que retorna las
+    intensidades_normalizadas directamente).
+
+    Flujo recomendado:
+        procesador = ProcesadorTirillas('imagen.png')
+        crudas, normalizadas, muestras, refs, img, prom_ref = procesador.detectar_y_extraer()
+        analizador = AnalizadorApoptosis()
+        reporte = analizador.calcular_fold_change(norm_control, norm_tratamiento)
     """
 
     def __init__(
@@ -1123,13 +1371,18 @@ class AnalizadorApoptosis:
 
     def calcular_fold_change(
         self,
-        intensidades_control: Dict[str, Optional[float]],
-        intensidades_tratamiento: Dict[str, Optional[float]]
+        intensidades_control: Dict[str, float],
+        intensidades_tratamiento: Dict[str, float]
     ) -> Dict:
         """
         Calcula el Fold Change (Tratamiento / Control) para cada proteína.
 
-        Reglas de cálculo:
+        IMPORTANTE: Las intensidades pasadas a este método deben ser las
+        Intensidades Relativas (ya normalizadas por promedio_ref). El pipeline
+        detectar_y_extraer() de ProcesadorTirillas retorna directamente
+        estas intensidades normalizadas.
+
+        Reglas de cálculo (sobre intensidades relativas):
         - Control > ε y Tratamiento > ε  → Fold = Tratamiento / Control
         - Control < ε y Tratamiento > ε  → Expresión de novo: float('inf')
         - Control > ε y Tratamiento < ε  → Silenciada: 0.0
@@ -1137,8 +1390,10 @@ class AnalizadorApoptosis:
         - Cualquier valor None            → Inválida: EXCLUIDA del reporte
 
         Args:
-            intensidades_control: Intensidades normalizadas del control.
-            intensidades_tratamiento: Intensidades normalizadas del tratamiento.
+            intensidades_control: Intensidades NORMALIZADAS del control
+                (intensidad_relativa = bruta / promedio_ref_control).
+            intensidades_tratamiento: Intensidades NORMALIZADAS del tratamiento
+                (intensidad_relativa = bruta / promedio_ref_tratamiento).
 
         Returns:
             Reporte estructurado {categoría: {proteína: fold_change}},
@@ -1284,36 +1539,35 @@ if __name__ == "__main__":
     #         # Procesar tile aquí (ej: detección de apoptosis con ML)
     #         pass
 
-    # --- Ejemplo 2: Análisis de membranas del Proteome Profiler ---
+    # --- Ejemplo 2: Análisis de membranas con normalización por referencia ---
 
     # procesador_ctrl = ProcesadorTirillas("membrana_control.jpg")  # o .scn
     # procesador_trat = ProcesadorTirillas("membrana_tratada.jpg")
     #
-    # img_ctrl = procesador_ctrl.preprocesar_imagen()
-    # img_trat = procesador_trat.preprocesar_imagen()
+    # # Pipeline completo: detectar spots + identificar 3 refs + normalizar
+    # (
+    #     crudas_ctrl, norm_ctrl,
+    #     muestras_ctrl, refs_ctrl,
+    #     img_ctrl, prom_ref_ctrl
+    # ) = procesador_ctrl.detectar_y_extraer(ruta_debug='debug_control.png')
     #
-    # cuadricula = {
-    #     'Reference_1': (10,  10, 15, 15),
-    #     'Reference_2': (30,  10, 15, 15),
-    #     'Bax':         (100, 200, 20, 20),
-    #     'Caspase-3':   (150, 200, 20, 20),
-    #     'Bcl-2':       (10,  10, 20, 20),
-    #     'Bad':         (50,  50, 20, 20),
-    # }
-    # REFS = ['Reference_1', 'Reference_2']
+    # (
+    #     crudas_trat, norm_trat,
+    #     muestras_trat, refs_trat,
+    #     img_trat, prom_ref_trat
+    # ) = procesador_trat.detectar_y_extraer(ruta_debug='debug_tratamiento.png')
     #
-    # datos_ctrl = procesador_ctrl.extraer_intensidad_puntos(img_ctrl, cuadricula)
-    # datos_trat = procesador_trat.extraer_intensidad_puntos(img_trat, cuadricula)
+    # print(f"Control:     promedio_ref = {prom_ref_ctrl:.4f}")
+    # print(f"Tratamiento: promedio_ref = {prom_ref_trat:.4f}")
+    # print(f"Intensidades normalizadas control: {norm_ctrl}")
+    # print(f"Intensidades normalizadas tratam.: {norm_trat}")
     #
+    # # Fold Change usando intensidades NORMALIZADAS (relativas)
     # analizador = AnalizadorApoptosis(
     #     pro_apoptoticas=['Bax', 'Caspase-3', 'Bad'],
     #     anti_apoptoticas=['Bcl-2']
     # )
-    #
-    # ctrl_norm = analizador.normalizar_por_referencia(datos_ctrl, REFS)
-    # trat_norm = analizador.normalizar_por_referencia(datos_trat, REFS)
-    #
-    # reporte = analizador.calcular_fold_change(ctrl_norm, trat_norm)
+    # reporte = analizador.calcular_fold_change(norm_ctrl, norm_trat)
     # print(json.dumps(reporte, indent=4, ensure_ascii=False))
 
     print("\nMotor cargado correctamente. Listo para análisis.")

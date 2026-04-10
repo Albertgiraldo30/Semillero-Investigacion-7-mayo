@@ -154,9 +154,10 @@ class AplicacionApoptosis(ctk.CTk):
             procesador_control = ProcesadorTirillas(self.ruta_control)
             procesador_experimento = ProcesadorTirillas(self.ruta_tratamiento)
 
-            # ── PASO 2: Pipeline Auto-ROI (denoising + CLAHE + Otsu + contornos) ──
+            # ── PASO 2: Pipeline Auto-ROI + Normalización por Referencia ──
             self.textbox_resultados.insert(ctk.END, "-> Mejorando imagen (denoising + CLAHE)...\n")
             self.textbox_resultados.insert(ctk.END, "-> Detectando manchas automáticamente (Otsu + contornos)...\n")
+            self.textbox_resultados.insert(ctk.END, "-> Identificando Reference Spots y normalizando...\n")
             self.update()
 
             # Directorio del proyecto para guardar imágenes debug
@@ -164,30 +165,36 @@ class AplicacionApoptosis(ctk.CTk):
             debug_ctrl = os.path.join(dir_proyecto, "debug_control.png")
             debug_trat = os.path.join(dir_proyecto, "debug_tratamiento.png")
 
-            datos_ctrl, manchas_ctrl, _ = procesador_control.detectar_y_extraer(ruta_debug=debug_ctrl)
-            datos_exp, manchas_exp, _ = procesador_experimento.detectar_y_extraer(ruta_debug=debug_trat)
+            # detectar_y_extraer() ahora retorna 6 valores:
+            # (crudas, normalizadas, muestras, referencias, imagen, promedio_ref)
+            crudas_ctrl, norm_ctrl, muestras_ctrl, refs_ctrl, _, prom_ref_ctrl = \
+                procesador_control.detectar_y_extraer(ruta_debug=debug_ctrl)
+            crudas_exp, norm_exp, muestras_exp, refs_exp, _, prom_ref_exp = \
+                procesador_experimento.detectar_y_extraer(ruta_debug=debug_trat)
 
-            # Mostrar estadísticas de detección
-            self.textbox_resultados.insert(ctk.END, f"\n   [Control]     Spots detectados: {len(manchas_ctrl)}\n")
-            self.textbox_resultados.insert(ctk.END, f"   [Tratamiento] Spots detectados: {len(manchas_exp)}\n\n")
+            # Mostrar estadísticas de detección y referencia
+            self.textbox_resultados.insert(ctk.END, f"\n   [Control]     Spots muestra: {len(muestras_ctrl)}, "
+                                                    f"Refs: {len(refs_ctrl)}, "
+                                                    f"Prom.Ref: {prom_ref_ctrl:.2f}\n")
+            self.textbox_resultados.insert(ctk.END, f"   [Tratamiento] Spots muestra: {len(muestras_exp)}, "
+                                                    f"Refs: {len(refs_exp)}, "
+                                                    f"Prom.Ref: {prom_ref_exp:.2f}\n\n")
             self.update()
 
-            if not datos_ctrl or not datos_exp:
+            if not norm_ctrl or not norm_exp:
                 self.textbox_resultados.insert(ctk.END, 
-                    "[!] ADVERTENCIA: No se detectaron manchas en una o ambas imágenes.\n"
+                    "[!] ADVERTENCIA: No se detectaron manchas suficientes en una o ambas imágenes.\n"
                     "    Verifique que las imágenes sean de membranas del Proteome Profiler.\n"
-                    "    Sugerencias: ajustar contraste de la imagen, o usar imágenes de mayor resolución.\n"
+                    "    Se necesitan al menos 4 spots (3 referencias + 1 muestra).\n"
                 )
                 return
 
-            # ── PASO 3: Calcular Fold Change ──
-            self.textbox_resultados.insert(ctk.END, "-> Calculando Fold Change y Resumen Clínico...\n\n")
+            # ── PASO 3: Calcular Fold Change con intensidades NORMALIZADAS ──
+            self.textbox_resultados.insert(ctk.END, "-> Calculando Fold Change (Intensidades Relativas)...\n\n")
             self.update()
 
-            # Usar todos los spots detectados como proteínas no clasificadas
-            # (se clasificarán cuando se mapeen a las posiciones del array ARY009)
             analizador = AnalizadorApoptosis()
-            reporte_cientifico = analizador.calcular_fold_change(datos_ctrl, datos_exp)
+            reporte_cientifico = analizador.calcular_fold_change(norm_ctrl, norm_exp)
 
             # ── PASO 4: Presentación de resultados ──
             texto_json = json.dumps(reporte_cientifico, indent=4, ensure_ascii=False)
@@ -196,19 +203,22 @@ class AplicacionApoptosis(ctk.CTk):
             self.textbox_resultados.insert(ctk.END, texto_json)
             self.textbox_resultados.insert(ctk.END, "\n====================================================\n\n")
             
-            # Resumen de spots detectados para debug
-            self.textbox_resultados.insert(ctk.END, "──── DETALLE DE SPOTS DETECTADOS ────\n")
-            self.textbox_resultados.insert(ctk.END, f"{'Spot':<10} {'Intensidad Ctrl':>15} {'Intensidad Trat':>15} {'Fold':>8}\n")
-            self.textbox_resultados.insert(ctk.END, "─" * 50 + "\n")
+            # Tabla de detalle: cruda, normalizada y fold
+            self.textbox_resultados.insert(ctk.END, "──── DETALLE DE SPOTS (Normalizados por Referencia) ────\n")
+            self.textbox_resultados.insert(ctk.END, f"{'Spot':<10} {'Cruda Ctrl':>11} {'Cruda Trat':>11} {'Norm Ctrl':>10} {'Norm Trat':>10} {'Fold':>7}\n")
+            self.textbox_resultados.insert(ctk.END, "─" * 62 + "\n")
             
-            for nombre in sorted(set(datos_ctrl.keys()) | set(datos_exp.keys())):
-                val_c = datos_ctrl.get(nombre, 0)
-                val_e = datos_exp.get(nombre, 0)
-                if val_c and val_c > 1.0:
-                    fold = round(val_e / val_c, 2) if val_e else 0.0
+            for nombre in sorted(set(norm_ctrl.keys()) | set(norm_exp.keys())):
+                vc = crudas_ctrl.get(nombre, 0)
+                ve = crudas_exp.get(nombre, 0)
+                nc = norm_ctrl.get(nombre, 0)
+                ne = norm_exp.get(nombre, 0)
+                if nc and nc > 0.001:
+                    fold = round(ne / nc, 4) if ne else 0.0
                 else:
-                    fold = "∞" if val_e else "-"
-                self.textbox_resultados.insert(ctk.END, f"{nombre:<10} {val_c:>15.2f} {val_e:>15.2f} {str(fold):>8}\n")
+                    fold = "∞" if ne else "-"
+                self.textbox_resultados.insert(ctk.END, 
+                    f"{nombre:<10} {vc:>11.2f} {ve:>11.2f} {nc:>10.4f} {ne:>10.4f} {str(fold):>7}\n")
             
         except Exception as e:
             error_mensaje = traceback.format_exc()
