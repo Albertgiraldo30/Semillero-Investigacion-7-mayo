@@ -9,6 +9,9 @@ venv/
 debug_*.png
 test_*.png
 
+# Archivos pesados
+*.zip
+
 # IDE
 .vscode/
 .idea/
