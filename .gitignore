@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Debug images (regenerables)
+debug_*.png
+test_*.png
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Fotos originales (muy pesadas para GitHub)
+fotos/
+fotos .zip
+
+# PDF extractions
+pdf_images/

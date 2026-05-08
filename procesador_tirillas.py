@@ -1,13 +1,29 @@
+"""
+procesador_tirillas.py — Módulo LEGACY (NO utilizado por el pipeline actual).
+
+Este módulo fue el primer prototipo del procesador de membranas.
+La versión actual usa motor_apoptosis.py → AnalizadorGrillaARY009.
+
+Se conserva como referencia y documentación del enfoque original.
+Para el pipeline activo, ver: motor_apoptosis.py + interfaz.py
+"""
+import warnings
+warnings.warn(
+    "procesador_tirillas.py es un módulo legacy. "
+    "El pipeline activo usa motor_apoptosis.AnalizadorGrillaARY009.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import cv2
 import logging
 import numpy as np
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s [%(name)s]: %(message)s')
-logger = logging.getLogger('AnalizadorApoptosis')
-
 # Umbral mínimo de intensidad para considerar que una proteína está realmente presente.
 # Intensidades por debajo de este valor se tratan como ruido de fondo del array.
 EPSILON_INTENSIDAD = 1.0
+
+logger = logging.getLogger('AnalizadorApoptosis')
 
 
 class ProcesadorTirillas:

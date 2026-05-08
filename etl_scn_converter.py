@@ -43,9 +43,74 @@ try:
 except ImportError:
     TQDM_DISPONIBLE = False
 
-# Importar motor de lectura WSI
-from motor_apoptosis import LectorWSI
+# Importar utilidades WSI
 from utils_wsi import filtrar_fondo
+
+# LectorWSI: wrapper de openslide para lectura de Whole Slide Images.
+# Requiere: pip install openslide-python openslide-bin
+try:
+    import openslide
+
+    class LectorWSI:
+        """Context manager para lectura de WSI usando OpenSlide."""
+
+        def __init__(self, ruta: str):
+            self.ruta = ruta
+            self._slide = None
+
+        def __enter__(self):
+            self._slide = openslide.OpenSlide(self.ruta)
+            return self
+
+        def __exit__(self, *args):
+            if self._slide:
+                self._slide.close()
+
+        def obtener_metadata(self) -> dict:
+            dim0 = self._slide.dimensions
+            niveles = self._slide.level_count
+            dims_por_nivel = [self._slide.level_dimensions[i] for i in range(niveles)]
+            return {
+                'dimensiones_nivel_0': dim0,
+                'niveles': niveles,
+                'dimensiones_por_nivel': dims_por_nivel,
+                'downsamples': list(self._slide.level_downsamples),
+            }
+
+        def obtener_thumbnail(self, max_dim: int = 2048) -> np.ndarray:
+            dim = self._slide.dimensions
+            escala = max_dim / max(dim)
+            thumb = self._slide.get_thumbnail(
+                (int(dim[0] * escala), int(dim[1] * escala)))
+            return np.array(thumb.convert('RGB'))
+
+        def leer_roi(self, x, y, ancho, alto, nivel=0) -> np.ndarray:
+            region = self._slide.read_region((x, y), nivel, (ancho, alto))
+            return np.array(region.convert('RGB'))
+
+        def iterar_tiles(self, tile_size=512, nivel=0, solo_tejido=True,
+                         umbral_blancura=0.85, overlap=0):
+            dim = self._slide.level_dimensions[nivel]
+            paso = tile_size - overlap
+            for y in range(0, dim[1], paso):
+                for x in range(0, dim[0], paso):
+                    region = self._slide.read_region(
+                        (x, y), nivel, (tile_size, tile_size))
+                    tile_np = np.array(region.convert('RGB'))
+                    if solo_tejido and not filtrar_fondo(tile_np, umbral_blancura):
+                        continue
+                    yield x, y, tile_np
+
+except ImportError:
+    class LectorWSI:
+        """Placeholder: openslide-python no está instalado."""
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "Este módulo requiere openslide-python y openslide-bin.\n"
+                "Instalar con: pip install openslide-python openslide-bin"
+            )
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
 
 # Configuración de logging
 logging.basicConfig(
