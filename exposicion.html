@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Exposición — Analizador Proteome Profiler ARY009</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0e1a;--card:#131832;--accent:#00d4ff;--accent2:#7c3aed;--accent3:#f472b6;--text:#e2e8f0;--dim:#64748b}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);overflow:hidden;height:100vh}
+.slide{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:60px 80px;opacity:0;pointer-events:none;transition:opacity .6s,transform .6s;transform:translateX(60px)}
+.slide.active{opacity:1;pointer-events:auto;transform:translateX(0)}
+.slide.prev{transform:translateX(-60px)}
+h1{font-size:3rem;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-align:center;margin-bottom:12px;line-height:1.2}
+h2{font-size:2.2rem;font-weight:700;color:var(--accent);margin-bottom:20px;text-align:center}
+h3{font-size:1.4rem;font-weight:600;color:var(--accent3);margin-bottom:12px}
+p,.desc{font-size:1.1rem;line-height:1.7;color:var(--text);max-width:900px;text-align:center}
+.subtitle{font-size:1.3rem;color:var(--dim);margin-bottom:30px;text-align:center}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:30px;width:100%;max-width:1100px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;width:100%;max-width:1100px}
+.card{background:var(--card);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:28px;transition:transform .3s,box-shadow .3s}
+.card:hover{transform:translateY(-4px);box-shadow:0 8px 30px rgba(0,212,255,.15)}
+.card h3{margin-bottom:10px}
+.card p{font-size:.95rem;text-align:left;color:#cbd5e1}
+.badge{display:inline-block;padding:4px 14px;border-radius:20px;font-size:.8rem;font-weight:600;margin:4px}
+.badge.pro{background:rgba(239,68,68,.2);color:#f87171;border:1px solid rgba(239,68,68,.3)}
+.badge.anti{background:rgba(59,130,246,.2);color:#60a5fa;border:1px solid rgba(59,130,246,.3)}
+.badge.tech{background:rgba(124,58,237,.2);color:#a78bfa;border:1px solid rgba(124,58,237,.3)}
+.step-num{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-weight:800;font-size:1.1rem;margin-bottom:10px}
+.nav{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:16px;z-index:100;background:rgba(19,24,50,.9);backdrop-filter:blur(10px);padding:12px 28px;border-radius:40px;border:1px solid rgba(255,255,255,.1)}
+.nav button{background:none;border:2px solid var(--accent);color:var(--accent);width:44px;height:44px;border-radius:50%;cursor:pointer;font-size:1.2rem;transition:all .2s}
+.nav button:hover{background:var(--accent);color:var(--bg)}
+.dots{display:flex;gap:8px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--dim);cursor:pointer;transition:all .3s}
+.dot.active{background:var(--accent);transform:scale(1.3)}
+.counter{color:var(--dim);font-size:.9rem;min-width:60px;text-align:center}
+.emoji{font-size:3rem;margin-bottom:16px}
+.highlight{color:var(--accent);font-weight:700}
+.highlight2{color:var(--accent3);font-weight:700}
+ul{text-align:left;max-width:800px;list-style:none}
+ul li{padding:8px 0;font-size:1.05rem;position:relative;padding-left:28px}
+ul li::before{content:'▸';position:absolute;left:0;color:var(--accent)}
+.img-container{width:280px;height:280px;border-radius:16px;overflow:hidden;border:2px solid rgba(0,212,255,.2);margin:0 auto 16px}
+.img-container img{width:100%;height:100%;object-fit:cover}
+table{border-collapse:collapse;width:100%;max-width:900px;margin:16px auto}
+th{background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;padding:10px 16px;font-size:.9rem}
+td{padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.9rem}
+tr:nth-child(even){background:rgba(255,255,255,.03)}
+.flow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;margin:20px 0}
+.flow-item{background:var(--card);border:1px solid rgba(0,212,255,.2);border-radius:12px;padding:14px 20px;text-align:center;min-width:140px}
+.flow-arrow{color:var(--accent);font-size:1.5rem}
+@keyframes fadeUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
+.slide.active .card,.slide.active .flow-item{animation:fadeUp .6s ease forwards}
+.slide.active .card:nth-child(2),.slide.active .flow-item:nth-child(3){animation-delay:.1s}
+.slide.active .card:nth-child(3),.slide.active .flow-item:nth-child(5){animation-delay:.2s}
+.slide.active .card:nth-child(4){animation-delay:.3s}
+</style>
+</head>
+<body>
+
+<!-- SLIDE 1: PORTADA -->
+<div class="slide active" id="s0">
+<div class="emoji">🔬</div>
+<h1>Analizador Automatizado de<br>Proteome Profiler ARY009</h1>
+<p class="subtitle">Semillero de Investigación Biomédica — Detección de Cáncer</p>
+<p class="subtitle" style="color:#94a3b8;font-size:1rem">Instituto Tecnológico Metropolitano (ITM) · 2026</p>
+<div style="margin-top:30px">
+<span class="badge tech">Python</span>
+<span class="badge tech">OpenCV</span>
+<span class="badge tech">Computer Vision</span>
+<span class="badge tech">Bioinformática</span>
+</div>
+</div>
+
+<!-- SLIDE 2: PROBLEMA -->
+<div class="slide" id="s1">
+<div class="emoji">🎯</div>
+<h2>El Problema</h2>
+<div class="grid2">
+<div class="card">
+<h3>📋 Contexto Clínico</h3>
+<p>La <strong>apoptosis</strong> (muerte celular programada) es un mecanismo clave para eliminar células dañadas. En el cáncer, este mecanismo falla y las células cancerosas <strong>evaden la muerte</strong>.</p>
+</div>
+<div class="card">
+<h3>🧪 El Kit ARY009</h3>
+<p>El <strong>Proteome Profiler Human Apoptosis Array</strong> de R&D Systems mide simultáneamente <strong>35 proteínas</strong> relacionadas con apoptosis en una sola membrana.</p>
+</div>
+<div class="card">
+<h3>⏱️ El Desafío</h3>
+<p>El análisis manual de las membranas es <strong>lento, subjetivo y propenso a errores</strong>. Un investigador puede tardar horas en cuantificar una sola imagen.</p>
+</div>
+<div class="card">
+<h3>💡 Nuestra Solución</h3>
+<p>Un <strong>pipeline automatizado</strong> basado en visión por computador que procesa, cuantifica e interpreta los resultados en <strong>segundos</strong>.</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 3: APOPTOSIS -->
+<div class="slide" id="s2">
+<div class="emoji">🧬</div>
+<h2>¿Qué es la Apoptosis?</h2>
+<div class="grid2" style="max-width:1000px">
+<div class="card" style="border-left:3px solid #ef4444">
+<h3 style="color:#f87171">⚔️ Proteínas Pro-Apoptóticas</h3>
+<p><strong>ACTIVAN</strong> la muerte celular. Un buen tratamiento las hace SUBIR.</p>
+<div style="margin-top:12px">
+<span class="badge pro">Bax</span><span class="badge pro">Bad</span><span class="badge pro">Caspase-3</span><span class="badge pro">Cytochrome c</span><span class="badge pro">SMAC/Diablo</span><span class="badge pro">TRAIL R1/DR4</span><span class="badge pro">p53</span>
+</div>
+</div>
+<div class="card" style="border-left:3px solid #3b82f6">
+<h3 style="color:#60a5fa">🛡️ Proteínas Anti-Apoptóticas</h3>
+<p><strong>BLOQUEAN</strong> la muerte celular. Un buen tratamiento las hace BAJAR.</p>
+<div style="margin-top:12px">
+<span class="badge anti">Bcl-2</span><span class="badge anti">Bcl-x</span><span class="badge anti">Survivin</span><span class="badge anti">XIAP</span><span class="badge anti">cIAP-1</span><span class="badge anti">HSP70</span><span class="badge anti">Livin</span>
+</div>
+</div>
+</div>
+<p style="margin-top:24px;color:var(--dim);max-width:800px">El balance entre estas dos familias determina si la célula <span class="highlight">vive</span> o <span class="highlight2">muere</span>. Nuestro sistema mide este balance automáticamente.</p>
+</div>
+
+<!-- SLIDE 4: ARQUITECTURA DEL KIT -->
+<div class="slide" id="s3">
+<h2>🧫 Estructura del Kit ARY009</h2>
+<div class="flow">
+<div class="flow-item"><strong>Tirilla 1</strong><br><small style="color:var(--accent)">Control réplica 1</small></div>
+<div class="flow-item"><strong>Tirilla 2</strong><br><small style="color:var(--accent)">Control réplica 2</small></div>
+<div class="flow-arrow">│</div>
+<div class="flow-item"><strong>Tirilla 3</strong><br><small style="color:var(--accent3)">Tratamiento réplica 1</small></div>
+<div class="flow-item"><strong>Tirilla 4</strong><br><small style="color:var(--accent3)">Tratamiento réplica 2</small></div>
+</div>
+<div class="grid3" style="margin-top:20px">
+<div class="card">
+<h3>📐 Grilla 5×24</h3>
+<p>Cada tirilla tiene 5 columnas (A-E) y 24 filas. Las proteínas están en duplicado (pares verticales) para validación interna.</p>
+</div>
+<div class="card">
+<h3>📍 Reference Spots</h3>
+<p>3 pares de puntos de referencia en las esquinas (A1-A2, A23-A24, E1-E2) para normalización inter-membrana.</p>
+</div>
+<div class="card">
+<h3>🔲 PBS (Fondo)</h3>
+<p>Control negativo en D23-D24. Se resta como línea base para eliminar el ruido de fondo del array.</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 5: PIPELINE TÉCNICO -->
+<div class="slide" id="s4">
+<h2>⚙️ Pipeline de Análisis</h2>
+<div class="flow">
+<div class="flow-item"><div class="step-num">1</div><br><strong>Carga</strong><br><small>Imagen 8/16-bit</small></div>
+<div class="flow-arrow">→</div>
+<div class="flow-item"><div class="step-num">2</div><br><strong>Separación</strong><br><small>4 tirillas</small></div>
+<div class="flow-arrow">→</div>
+<div class="flow-item"><div class="step-num">3</div><br><strong>Anclaje</strong><br><small>Reference Spots</small></div>
+<div class="flow-arrow">→</div>
+<div class="flow-item"><div class="step-num">4</div><br><strong>Grilla</strong><br><small>Safe Snapping + ICP</small></div>
+<div class="flow-arrow">→</div>
+<div class="flow-item"><div class="step-num">5</div><br><strong>Muestreo</strong><br><small>Intensidades</small></div>
+<div class="flow-arrow">→</div>
+<div class="flow-item"><div class="step-num">6</div><br><strong>Fold Change</strong><br><small>+ propagación error</small></div>
+</div>
+<div class="grid2" style="margin-top:24px">
+<div class="card">
+<h3>🔍 Detección de Spots — Black-Hat</h3>
+<p>Transformación morfológica que aísla puntos oscuros sobre fondo claro, inmune a sombras globales. Multi-escala (kernels 11-23px) para capturar spots de todos los tamaños.</p>
+</div>
+<div class="card">
+<h3>📏 Anclaje Geométrico</h3>
+<p>Los Reference Spots sirven como anclas para construir la grilla. Se usa interpolación bilineal + corrección trapezoidal para manejar curvatura de membrana.</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 6: ALGORITMOS CLAVE -->
+<div class="slide" id="s5">
+<h2>🧠 Algoritmos Clave</h2>
+<div class="grid2">
+<div class="card">
+<h3>🎯 Safe Snapping Iterativo</h3>
+<p>Mean-shift local de 3 pasadas con ROI decreciente:<br>
+<strong>Pasada 1:</strong> ROI amplio (1.2×) — atrae spots lejanos<br>
+<strong>Pasada 2:</strong> ROI medio (0.85×) — refina posición<br>
+<strong>Pasada 3:</strong> ROI fino (0.55×) — centra con precisión<br>
+Aplica clamping estricto para que los cuadros no migren entre columnas.</p>
+</div>
+<div class="card">
+<h3>🔄 ICP (Iterative Closest Point)</h3>
+<p>Alineación afín (rotación + traslación + escala) de la grilla a los spots reales detectados. Usa RANSAC para robustez, con safeguards: escala 0.85-1.15×, rotación máx ±15°.</p>
+</div>
+<div class="card">
+<h3>📊 Cuantificación</h3>
+<p><strong>1.</strong> Restar fondo PBS (control negativo)<br>
+<strong>2.</strong> Normalizar por Reference Spots<br>
+<strong>3.</strong> Promediar réplicas internas (2 strips)<br>
+<strong>4.</strong> Fold Change = Tratamiento / Control<br>
+<strong>5.</strong> Propagación de error: σ_FC/FC = √((σ_T/T)² + (σ_C/C)²)</p>
+</div>
+<div class="card">
+<h3>🏷️ Separación Dual de Strips</h3>
+<p><strong>Estrategia 1:</strong> Contraste de brillo (membrana gris vs fondo blanco) con Otsu + cierre morfológico.<br>
+<strong>Estrategia 2:</strong> Black-Hat para aislar solo spots oscuros como fallback.</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 7: INTERFAZ -->
+<div class="slide" id="s6">
+<h2>🖥️ Interfaz Gráfica</h2>
+<p class="desc" style="margin-bottom:24px">4 pestañas integradas en una GUI moderna con CustomTkinter + Matplotlib</p>
+<div class="grid2">
+<div class="card">
+<h3>📋 Pestaña: Reporte</h3>
+<p>Tabla completa con intensidades Control vs Tratamiento, fold change, barras de error y estado de cada proteína. Clasificación automática por tipo biológico.</p>
+</div>
+<div class="card">
+<h3>🧬 Pestaña: Interpretación</h3>
+<p>Explicación en español con puntaje apoptótico, balance Bax/Bcl-2, hallazgos principales y veredicto clínico orientativo. Incluye notas sobre limitaciones estadísticas.</p>
+</div>
+<div class="card">
+<h3>📊 Pestaña: Gráficos</h3>
+<p>Barras horizontales estilo paper científico. Panel A: pro-apoptóticas. Panel C: anti-apoptóticas. Con error bars y p-valores aproximados (Welch t-test).</p>
+</div>
+<div class="card">
+<h3>🗺️ Pestaña: Mapa Visual</h3>
+<p>Visualización de lo que el programa "ve" sobre cada tirilla. Cuadros de muestreo con colores por tipo y estilo por calidad (sólido vs punteado). Modo manual para ajustar referencias.</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 8: ESTRUCTURA DEL CÓDIGO -->
+<div class="slide" id="s7">
+<h2>📁 Arquitectura del Proyecto</h2>
+<table>
+<tr><th>Archivo</th><th>Líneas</th><th>Función</th></tr>
+<tr><td><strong>motor_apoptosis.py</strong></td><td>~1,800</td><td>Motor de análisis: detección Black-Hat, grilla, Safe Snapping, ICP, cuantificación</td></tr>
+<tr><td><strong>interfaz.py</strong></td><td>~1,240</td><td>GUI con CustomTkinter + Matplotlib: 4 pestañas, modo manual, exportación Excel</td></tr>
+<tr><td><strong>procesador_tirillas.py</strong></td><td>~410</td><td>Clases base: ProcesadorTirillas (alineación, ROI) y AnalizadorApoptosis (fold change)</td></tr>
+<tr><td><strong>mapa_array.py</strong></td><td>~103</td><td>Mapa oficial del kit: 35 proteínas → coordenadas (col, fila), clasificación biológica</td></tr>
+<tr><td><strong>utils_wsi.py</strong></td><td>~140</td><td>Utilidades para Whole Slide Images (archivos de escáner .SCN)</td></tr>
+<tr><td><strong>etl_scn_converter.py</strong></td><td>~530</td><td>Conversor masivo .SCN → TIFF/PNG para imágenes de escáner</td></tr>
+</table>
+<p style="margin-top:20px;color:var(--dim)">Total: <span class="highlight">~4,200+ líneas</span> de código Python</p>
+</div>
+
+<!-- SLIDE 9: TECNOLOGÍAS -->
+<div class="slide" id="s8">
+<h2>🛠️ Stack Tecnológico</h2>
+<div class="grid3">
+<div class="card" style="text-align:center">
+<div style="font-size:2.5rem">🐍</div>
+<h3>Python 3</h3>
+<p style="text-align:center">Lenguaje principal del proyecto</p>
+</div>
+<div class="card" style="text-align:center">
+<div style="font-size:2.5rem">👁️</div>
+<h3>OpenCV</h3>
+<p style="text-align:center">Visión por computador: Black-Hat, contornos, transformaciones</p>
+</div>
+<div class="card" style="text-align:center">
+<div style="font-size:2.5rem">🔢</div>
+<h3>NumPy</h3>
+<p style="text-align:center">Cálculo numérico: matrices, estadísticas, interpolación</p>
+</div>
+<div class="card" style="text-align:center">
+<div style="font-size:2.5rem">📊</div>
+<h3>Matplotlib</h3>
+<p style="text-align:center">Gráficos científicos integrados en la GUI</p>
+</div>
+<div class="card" style="text-align:center">
+<div style="font-size:2.5rem">🖼️</div>
+<h3>CustomTkinter</h3>
+<p style="text-align:center">Interfaz gráfica moderna con tema oscuro</p>
+</div>
+<div class="card" style="text-align:center">
+<div style="font-size:2.5rem">📄</div>
+<h3>OpenPyXL</h3>
+<p style="text-align:center">Exportación a Excel con formato profesional</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 10: RESULTADOS -->
+<div class="slide" id="s9">
+<h2>📈 Resultados y Capacidades</h2>
+<div class="grid2">
+<div class="card" style="border-left:3px solid var(--accent)">
+<h3>✅ Logros del Sistema</h3>
+<ul>
+<li>Análisis completo en <span class="highlight">segundos</span> vs horas manual</li>
+<li>Detección de <span class="highlight">35 proteínas</span> simultáneamente</li>
+<li>Soporte para imágenes 8-bit y <span class="highlight">16-bit</span> (alta precisión)</li>
+<li>Fold Change con <span class="highlight">propagación de error</span></li>
+<li>Puntaje apoptótico <span class="highlight">automatizado</span></li>
+<li>Exportación a <span class="highlight">Excel</span> con formato profesional</li>
+</ul>
+</div>
+<div class="card" style="border-left:3px solid var(--accent3)">
+<h3>🔬 Innovaciones Técnicas</h3>
+<ul>
+<li><span class="highlight2">Safe Snapping</span> iterativo para centrar cuadros</li>
+<li>Refinamiento <span class="highlight2">ICP</span> (Iterative Closest Point)</li>
+<li>Detección <span class="highlight2">multi-escala</span> de spots</li>
+<li>Corrección <span class="highlight2">trapezoidal</span> para curvatura</li>
+<li>Modo <span class="highlight2">manual</span> de calibración por clicks</li>
+<li>Score de <span class="highlight2">calidad</span> por cuadro de muestreo</li>
+</ul>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 11: CONCLUSIONES -->
+<div class="slide" id="s10">
+<div class="emoji">🏆</div>
+<h2>Conclusiones</h2>
+<div class="grid2" style="max-width:900px">
+<div class="card">
+<h3>🎯 Impacto</h3>
+<p>El sistema transforma un proceso manual subjetivo en un análisis <strong>reproducible, rápido y cuantitativo</strong>, permitiendo a investigadores enfocarse en la interpretación biológica.</p>
+</div>
+<div class="card">
+<h3>🔮 Trabajo Futuro</h3>
+<p>• Integración con bases de datos de proteínas<br>
+• Soporte para otros kits Proteome Profiler<br>
+• Machine Learning para clasificación automática<br>
+• Validación clínica multicéntrica</p>
+</div>
+</div>
+<div style="margin-top:40px;text-align:center">
+<p style="font-size:1.4rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--accent3));-webkit-background-clip:text;-webkit-text-fill-color:transparent">¡Gracias por su atención!</p>
+<p style="color:var(--dim);margin-top:8px">Semillero de Investigación Biomédica — ITM, 2026</p>
+</div>
+</div>
+
+<!-- NAVEGACIÓN -->
+<nav class="nav">
+<button onclick="prev()" id="btnPrev">◀</button>
+<div class="dots" id="dots"></div>
+<span class="counter" id="counter">1 / 11</span>
+<button onclick="next()" id="btnNext">▶</button>
+</nav>
+
+<script>
+const slides=document.querySelectorAll('.slide');
+let cur=0;
+const total=slides.length;
+const dots=document.getElementById('dots');
+const counter=document.getElementById('counter');
+
+for(let i=0;i<total;i++){
+  const d=document.createElement('div');
+  d.className='dot'+(i===0?' active':'');
+  d.onclick=()=>goTo(i);
+  dots.appendChild(d);
+}
+
+function goTo(n){
+  slides[cur].classList.remove('active');
+  slides[cur].classList.add(n>cur?'prev':'');
+  setTimeout(()=>slides[cur].className='slide',600);
+  cur=n;
+  slides[cur].classList.add('active');
+  document.querySelectorAll('.dot').forEach((d,i)=>d.classList.toggle('active',i===cur));
+  counter.textContent=`${cur+1} / ${total}`;
+}
+function next(){if(cur<total-1)goTo(cur+1)}
+function prev(){if(cur>0)goTo(cur-1)}
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'||e.key===' ')next();
+  if(e.key==='ArrowLeft')prev();
+});
+</script>
+</body>
+</html>

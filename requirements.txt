@@ -1,0 +1,7 @@
+# Dependencias del Analizador Proteome Profiler ARY009
+opencv-python>=4.5
+numpy>=1.20
+matplotlib>=3.5
+customtkinter>=5.0
+Pillow>=9.0
+openpyxl>=3.0

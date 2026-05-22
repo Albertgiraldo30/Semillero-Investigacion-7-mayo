@@ -14,6 +14,7 @@ matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import numpy as np
+from PIL import Image
 
 from motor_apoptosis import (
     AnalizadorGrillaARY009,
@@ -107,12 +108,27 @@ class App(ctk.CTk):
             wraplength=900, justify="left",
         ).grid(row=1, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="w")
 
+        # Frame para botón analizar + opciones
+        frame_btn = ctk.CTkFrame(self, fg_color="transparent")
+        frame_btn.pack(pady=12)
+
         self.btn_analizar = ctk.CTkButton(
-            self, text="Analizar Membranas",
+            frame_btn, text="Analizar Membranas",
             fg_color="#28a745", hover_color="#1e7e34",
             font=ctk.CTkFont(size=15, weight="bold"),
             height=44, command=self._analizar)
-        self.btn_analizar.pack(pady=12)
+        self.btn_analizar.pack(side="left", padx=(0, 12))
+
+        # Checkbox: Modo rígido (sin snap ni ICP - geometría pura)
+        self.var_rigido = ctk.BooleanVar(value=False)
+        self.chk_rigido = ctk.CTkCheckBox(
+            frame_btn,
+            text="Modo rígido\n(sin snap, geometría pura)",
+            variable=self.var_rigido,
+            font=ctk.CTkFont(size=10),
+            checkbox_width=18, checkbox_height=18,
+        )
+        self.chk_rigido.pack(side="left")
 
         # ── Tabview con 3 pestañas ──
         self.tabs = ctk.CTkTabview(self, height=450)
@@ -164,7 +180,6 @@ class App(ctk.CTk):
         self._canvas_sub_mapas = [None] * 4
 
         # Cargar y mostrar la imagen estática en la pestaña "Guía de Proteínas"
-        from PIL import Image
         frame_guia = ctk.CTkScrollableFrame(self.tabs_mapa.tab("Guía de Proteínas"), fg_color="transparent")
         frame_guia.pack(fill="both", expand=True)
         mapa_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mapa_referencia_ary009.png")
@@ -221,8 +236,12 @@ class App(ctk.CTk):
             dir_img = os.path.dirname(self._ruta)
             ruta_debug = os.path.join(dir_img, "debug_grilla.png")
 
-            self._log("→ Separando 4 membranas y anclando grilla en Reference Spots…\n")
-            self._analizador = AnalizadorGrillaARY009(radio_muestreo=8)
+            modo_rigido = bool(self.var_rigido.get())
+            modo_txt = "RÍGIDO (geometría pura)" if modo_rigido else "ADAPTATIVO (snap+ICP)"
+            self._log(f"→ Separando 4 membranas y anclando grilla en Reference Spots…\n")
+            self._log(f"   Modo: {modo_txt}\n")
+            self._analizador = AnalizadorGrillaARY009(
+                radio_muestreo=8, modo_rigido=modo_rigido)
             intensidades_por_strip = self._analizador.analizar_imagen(
                 self._ruta, n_strips=4, ruta_debug=ruta_debug)
 
@@ -277,12 +296,13 @@ class App(ctk.CTk):
         r = self._reporte
         cuant_c = self._cuant_ctrl_avg
         cuant_t = self._cuant_trat_avg
+        cuant_lista = self._cuant_lista  # las 4 tirillas individuales
 
         lineas = [
-            "=" * 78,
+            "=" * 90,
             "  REPORTE DE RESULTADOS",
             "  Control = promedio de tirillas 1-2  |  Tratamiento = promedio de tirillas 3-4",
-            "=" * 78,
+            "=" * 90,
             "",
             "  CÓMO LEER LA TABLA:",
             "    • 'Control' y 'Tratam.': intensidad de la proteína en cada condición.",
@@ -299,6 +319,102 @@ class App(ctk.CTk):
             f"Fondo PBS tratamiento:  {cuant_t.get('pbs', 0):.1f}",
             "",
         ]
+
+        # ── SECCIÓN: Valores INDIVIDUALES por tirilla ──
+        if len(cuant_lista) >= 4:
+            lineas += [
+                "═" * 90,
+                "  📋 VALORES INDIVIDUALES POR TIRILLA (sin promediar)",
+                "═" * 90,
+                "",
+                "  Para comparar las réplicas internas y ver si las 4 tirillas dieron",
+                "  resultados similares o no. Si T1 y T2 son muy distintos (o T3 y T4),",
+                "  significa que las réplicas no concuerdan → resultado poco confiable.",
+                "",
+                "  Referencias y PBS por tirilla:",
+            ]
+            for i, c in enumerate(cuant_lista[:4]):
+                etiq = ['T1 (Ctrl)', 'T2 (Ctrl)', 'T3 (Trat)', 'T4 (Trat)'][i]
+                lineas.append(
+                    f"    {etiq}: Ref={c.get('referencia', 0):>6.1f}  "
+                    f"(útil={c.get('referencia_neta', 0):>6.1f})  "
+                    f"PBS={c.get('pbs', 0):>5.1f}"
+                )
+            lineas.append("")
+
+            # Cabecera de la tabla individual
+            lineas.append(
+                f"  {'Proteína':<26} "
+                f"{'T1 Ctrl':>9} {'T2 Ctrl':>9} {'T3 Trat':>9} {'T4 Trat':>9}  "
+                f"{'¿Réplicas OK?':<14}"
+            )
+            lineas.append("  " + "─" * 86)
+
+            # Ordenar por categoría (pro, anti, otros)
+            from mapa_array import PRO_APOPTOTICAS, ANTI_APOPTOTICAS
+            def categoria(prot):
+                if prot in PRO_APOPTOTICAS: return 0
+                if prot in ANTI_APOPTOTICAS: return 1
+                return 2
+
+            # Obtener todas las proteínas únicas de cualquier tirilla
+            todas_prot = set()
+            for c in cuant_lista[:4]:
+                todas_prot.update(c.get('proteinas', {}).keys())
+            todas_prot = sorted(todas_prot, key=lambda p: (categoria(p), p))
+
+            # Tipos previos para separar con un saltito
+            tipo_prev = None
+            for prot in todas_prot:
+                tipo_actual = categoria(prot)
+                if tipo_prev is not None and tipo_actual != tipo_prev:
+                    lineas.append("  " + "·" * 86)
+                tipo_prev = tipo_actual
+
+                # Tomar valor normalizado por tirilla
+                vals = []
+                for c in cuant_lista[:4]:
+                    v = c.get('proteinas', {}).get(prot, {}).get('normalizada', None)
+                    vals.append(v if v is not None else 0.0)
+
+                # Evaluar consistencia de réplicas
+                # Ctrl: T1 vs T2 — Trat: T3 vs T4
+                def consistencia(a, b):
+                    if a == 0 and b == 0:
+                        return "—"
+                    mean = (a + b) / 2
+                    if mean < 0.001:
+                        return "—"
+                    diff_pct = abs(a - b) / mean
+                    if diff_pct < 0.10:
+                        return "✓"   # <10% diferencia = OK
+                    if diff_pct < 0.30:
+                        return "~"   # 10-30% = aceptable
+                    return "✗"       # >30% = mal
+
+                cons_ctrl = consistencia(vals[0], vals[1])
+                cons_trat = consistencia(vals[2], vals[3])
+                cons_str = f"Ctrl:{cons_ctrl} Trat:{cons_trat}"
+
+                lineas.append(
+                    f"  {prot:<26} "
+                    f"{vals[0]:>9.4f} {vals[1]:>9.4f} {vals[2]:>9.4f} {vals[3]:>9.4f}  "
+                    f"{cons_str:<14}"
+                )
+
+            lineas += [
+                "",
+                "  📊 Interpretación de '¿Réplicas OK?':",
+                "    ✓ = las dos tirillas dieron valores casi iguales (<10% diferencia)",
+                "    ~ = diferencia moderada (10-30%) — usar con cautela",
+                "    ✗ = diferencia grande (>30%) — POCO CONFIABLE, revisar tirillas",
+                "    — = proteína no detectada en ninguna réplica",
+                "",
+                "═" * 90,
+                "  📊 TABLA PROMEDIADA (Control vs Tratamiento)",
+                "═" * 90,
+                "",
+            ]
 
         por_tipo = {
             "ACTIVADORAS DE MUERTE CELULAR (pro-apoptóticas)": [],
@@ -814,24 +930,24 @@ class App(ctk.CTk):
                 c = color_tipo(proteina)
                 radio = analizador.get_radio_dinamico(refs[0], refs[2]) if None not in refs else analizador.radio
 
-                # Estilo según calidad:
-                #   alta (>=0.6): borde sólido grueso, alpha 0.95
-                #   media (0.3-0.6): borde sólido normal, alpha 0.7
-                #   baja (<0.3): borde punteado, alpha 0.35 (cuadro vacío)
+                # Estilo según calidad (ligeramente más visible para mejor lectura):
+                #   alta (>=0.6): borde sólido grueso, alpha 1.0
+                #   media (0.3-0.6): borde sólido, alpha 0.85
+                #   baja (<0.3): borde punteado, alpha 0.60 (cuadro vacío pero visible)
                 if calidad >= 0.6:
                     estilo = '-'
-                    grosor = 1.2
-                    alpha = 0.95
+                    grosor = 1.8
+                    alpha = 1.0
                     n_alta += 1
                 elif calidad >= 0.3:
                     estilo = '-'
-                    grosor = 0.9
-                    alpha = 0.70
+                    grosor = 1.4
+                    alpha = 0.85
                     n_media += 1
                 else:
                     estilo = ':'
-                    grosor = 0.7
-                    alpha = 0.35
+                    grosor = 1.1
+                    alpha = 0.60
                     n_baja += 1
 
                 rect = Rectangle(
@@ -854,6 +970,34 @@ class App(ctk.CTk):
                 ax_img.text(x_avg, -10, col_letra,
                             ha='center', va='bottom',
                             fontsize=10, color='#ddd', weight='bold', zorder=5)
+
+            # ── DIAGNÓSTICO: marcadores SUTILES de TL/TR/BL detectados ──
+            # Muestra dónde el algoritmo cree que están los Reference Spots,
+            # con estilo discreto para no tapar la imagen.
+            refs_diag = d.get('refs_puntos')
+            if refs_diag is not None and None not in refs_diag[:3]:
+                tl_d, tr_d, bl_d = refs_diag[0], refs_diag[1], refs_diag[2]
+                etiquetas = [
+                    (tl_d, 'A↑', '#FFD700'),
+                    (tr_d, 'E↑', '#FFD700'),
+                    (bl_d, 'A↓', '#FFD700'),
+                ]
+                for (px_a, py_a), label, color_a in etiquetas:
+                    # Círculo discreto (más pequeño, transparente)
+                    ax_img.plot(
+                        px_a, py_a, 'o',
+                        markersize=11, markerfacecolor='none',
+                        markeredgecolor=color_a, markeredgewidth=1.2,
+                        alpha=0.7, zorder=8,
+                    )
+                    # Etiqueta pequeña sin fondo
+                    ax_img.annotate(
+                        label,
+                        xy=(px_a, py_a),
+                        xytext=(px_a + 9, py_a - 9),
+                        color=color_a, fontsize=7, weight='normal',
+                        alpha=0.85, zorder=9,
+                    )
 
             # Recortar el eje Y para mostrar solo la zona de las manchas
             y_coords = [val[1] for val in d['posiciones'].values()]

@@ -74,7 +74,7 @@ PRO_APOPTOTICAS = [
     "SMAC/Diablo", "FADD", "TRAIL R1/DR4", "TRAIL R2/DR5",
     "Fas/TNFRSF6/CD95", "TNF RI/TNFRSF1A",
     "Phospho-p53 (S15)", "Phospho-p53 (S46)", "Phospho-p53 (S392)",
-    "Phospho-Rad17 (S635)", "HTRA2/Omi", "HIF-1a",
+    "Phospho-Rad17 (S635)", "HTRA2/Omi",
 ]
 
 ANTI_APOPTOTICAS = [
