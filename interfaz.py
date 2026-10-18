@@ -2,6 +2,7 @@
 interfaz.py — GUI del Analizador Proteome Profiler ARY009
 Semillero Biomédica — Detección de Cáncer, ITM
 """
+import logging
 import os
 import threading
 import traceback
@@ -27,6 +28,27 @@ from mapa_array import (PRO_APOPTOTICAS, ANTI_APOPTOTICAS, PROTEINAS_UNICAS,
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+
+class _HandlerLogGUI(logging.Handler):
+    """Lleva los avisos del motor al textbox de resultados.
+
+    El motor emite warnings que cambian cómo se debe leer un resultado
+    ("Duplicados discordantes", "Solo se detectaron N/M tirillas",
+    "fallback CLAHE", "Strip N: sin referencias"), pero van a stderr.
+    Quien abre la app con doble clic no tiene consola, así que nunca los
+    veía: interpretaba datos de calidad dudosa como si fueran limpios.
+    """
+
+    def __init__(self, destino):
+        super().__init__(level=logging.WARNING)
+        self._destino = destino
+
+    def emit(self, record):
+        try:
+            self._destino(f"   [!] {record.getMessage()}\n")
+        except Exception:
+            pass  # un fallo al loguear nunca debe tumbar el análisis
 
 
 # ── Descripciones simples (para personas no especialistas) ──────────
@@ -232,6 +254,9 @@ class App(ctk.CTk):
         threading.Thread(target=self._run_analisis, daemon=True).start()
 
     def _run_analisis(self):
+        log_motor = logging.getLogger('MotorApoptosis')
+        handler_gui = _HandlerLogGUI(self._log)
+        log_motor.addHandler(handler_gui)
         try:
             dir_img = os.path.dirname(self._ruta)
             ruta_debug = os.path.join(dir_img, "debug_grilla.png")
@@ -285,9 +310,17 @@ class App(ctk.CTk):
             self.after(0, self._mostrar_mapa_visual)
             self.after(0, lambda: self.btn_export.configure(state="normal"))
 
+        except ValueError as e:
+            # El motor lanza ValueError con un mensaje redactado para el usuario
+            # (p.ej. no se detectó ninguna tirilla). Mostrarlo tal cual es más
+            # útil que un traceback y no requiere que lea la consola.
+            self._log(f"\n[ERROR] {e}\n")
+            self.after(0, lambda msg=str(e): messagebox.showerror(
+                "No se pudo analizar la imagen", msg))
         except Exception:
             self._log(f"\n[ERROR]\n{traceback.format_exc()}\n")
         finally:
+            log_motor.removeHandler(handler_gui)
             self.after(0, lambda: self.btn_analizar.configure(
                 state="normal", text="Analizar Membranas"))
 
@@ -1365,6 +1398,48 @@ class App(ctk.CTk):
         ws3.column_dimensions['A'].width = 28
         for i in range(len(self._cuant_lista)):
             ws3.column_dimensions[chr(ord('B') + i)].width = 24
+
+        # ── Hoja 4: Alertas de calidad ────────────────────────────────
+        # Para que quien lea el Excel sepa qué números son confiables.
+        ws4 = wb.create_sheet("Alertas de calidad")
+        cab = ["Tirilla", "Proteína", "Alerta", "Qué significa"]
+        for col, h in enumerate(cab, 1):
+            c = ws4.cell(1, col, h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+        alertas = (self._analizador.obtener_alertas()
+                   if self._analizador is not None
+                   and hasattr(self._analizador, "obtener_alertas") else [])
+        fila_a = 2
+        amarillo = PatternFill("solid", fgColor="FFF2CC")
+        rojo = PatternFill("solid", fgColor="F8CBAD")
+        for i, al in enumerate(alertas):
+            etiq = etiquetas_tirilla[i] if i < len(etiquetas_tirilla) else f"Tirilla {i+1}"
+            filas = []
+            if al.get('sin_referencias'):
+                filas.append(("(toda)", "Sin referencias",
+                              "No se pudo ubicar la grilla: la tirilla no aporta datos.", rojo))
+            if al.get('recalibrada_manual'):
+                filas.append(("(toda)", "Recalibrada a mano",
+                              "La grilla se ubicó con clics del usuario.", amarillo))
+            for prot in al.get('saturadas', []):
+                if prot == 'Reference':
+                    filas.append((prot, "Referencia saturada",
+                                  "La normalización de TODA la tirilla no es confiable.", rojo))
+                else:
+                    filas.append((prot, "Spot saturado",
+                                  "La intensidad real puede ser mayor a la medida.", amarillo))
+            for prot in al.get('discordantes', []):
+                filas.append((prot, "Duplicados discordantes",
+                              "Los dos puntos de la proteína difieren mucho: baja confianza.", amarillo))
+            for prot, tipo, expl, relleno in filas:
+                for col, v in enumerate([etiq, prot, tipo, expl], 1):
+                    ws4.cell(fila_a, col, v).fill = relleno
+                fila_a += 1
+        if fila_a == 2:
+            ws4.cell(2, 1, "Sin alertas: todas las mediciones pasaron los controles.")
+        for col_letter, width in zip("ABCD", [28, 26, 24, 60]):
+            ws4.column_dimensions[col_letter].width = width
 
         wb.save(ruta)
         messagebox.showinfo("Exportado", f"Resultados guardados en:\n{ruta}")

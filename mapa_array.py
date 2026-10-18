@@ -5,10 +5,17 @@ Cada proteína ocupa 2 spots duplicados (pares verticales).
 Columnas: A (derecha), B, C, D, E (izquierda)
 Filas: 1-24 (arriba → abajo)
 
+Los duplicados son pares de filas impar/par: (1,2), (3,4), (5,6) … (23,24).
+Dos filas consecutivas que NO formen uno de esos pares — (2,3), por ejemplo —
+son proteínas distintas. El motor depende de esta regla al deduplicar spots.
+
 Reference Spots (según datasheet oficial R&D Systems ARY009):
   - A1, A2  → esquina superior derecha
   - A23, A24 → esquina inferior derecha
   - E1, E2  → esquina superior izquierda
+
+Control negativo PBS: D23, D24. Su intensidad se resta como fondo a las 35
+proteínas en cuantificar(), así que debe leer bajo: nunca se resuelve por máximo.
 """
 
 # Mapeo de coordenada (columna, fila) → nombre de proteína/control
@@ -89,6 +96,16 @@ ANTI_APOPTOTICAS = [
 PARES_DUPLICADOS = {}
 for coord, nombre in MAPA_PROTEINAS.items():
     PARES_DUPLICADOS.setdefault(nombre, []).append(coord)
+
+# Posición horizontal de cada columna, como fracción del ancho A→E.
+# NO es uniforme: el salto D→E es mucho mayor que los otros tres. Está medido
+# sobre las membranas reales por perfil de proyección, y se confirma a 2x y 4x
+# (los saltos en píxeles salen al doble entre una escala y otra).
+#
+# Vive aquí, y no en el motor, porque es geometría del kit y la usan dos
+# módulos: motor_apoptosis (_T_COLS) y gridfit_ary009. Tenerlo duplicado
+# permitiría que divergieran en silencio.
+T_COLS = {'A': 0.0, 'B': 0.21, 'C': 0.43, 'D': 0.64, 'E': 1.0}
 
 # Coordenadas de Reference Spots
 COORDS_REFERENCIA = [c for c, n in MAPA_PROTEINAS.items() if n == "Reference"]

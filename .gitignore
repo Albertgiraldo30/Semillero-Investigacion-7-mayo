@@ -26,3 +26,9 @@ fotos .zip
 
 # PDF extractions
 pdf_images/
+
+# Respaldos locales y salidas de pruebas (regenerables)
+_respaldo_*/
+tests/debug/
+tests/verificacion_externa/
+tests/*.xlsx

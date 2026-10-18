@@ -10,8 +10,9 @@ from typing import Optional, Dict, Tuple, List
 
 from mapa_array import (
     MAPA_PROTEINAS, PROTEINAS_UNICAS, PRO_APOPTOTICAS, ANTI_APOPTOTICAS,
-    COORDS_REFERENCIA, COORDS_PBS, PARES_DUPLICADOS,
+    COORDS_REFERENCIA, COORDS_PBS, PARES_DUPLICADOS, T_COLS,
 )
+import gridfit_ary009
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s [%(name)s]: %(message)s')
 logger = logging.getLogger('MotorApoptosis')
@@ -19,11 +20,10 @@ logger = logging.getLogger('MotorApoptosis')
 EPSILON = 1.0
 
 
-
-
 # =====================================================================
 # 1. Detección robusta de spots (Black-Hat)
 # =====================================================================
+
 
 def detectar_spots_en_strip(strip_bgr: np.ndarray) -> List[Dict]:
     """
@@ -31,27 +31,27 @@ def detectar_spots_en_strip(strip_bgr: np.ndarray) -> List[Dict]:
     puntos pequeños y oscuros sobre un fondo claro, ignorando sombras globales.
     """
     gris = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2GRAY)
-    
+
     # 1. Denoising ligero
     gris = cv2.GaussianBlur(gris, (3, 3), 0)
-    
+
     # 2. Black-Hat transform: extrae elementos oscuros (más pequeños que el kernel)
     # Un spot típico en microarray mide ~5-15 píxeles de diámetro
     tam_kernel = 25
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tam_kernel, tam_kernel))
     blackhat = cv2.morphologyEx(gris, cv2.MORPH_BLACKHAT, kernel)
-    
+
     # Ahora 'blackhat' tiene los spots como píxeles brillantes sobre fondo negro
     # 3. Umbralización sobre el resultado
     _, binaria = cv2.threshold(blackhat, 15, 255, cv2.THRESH_BINARY)
-    
+
     # 4. Limpieza (quitar ruido de 1 o 2 píxeles)
     k_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binaria = cv2.morphologyEx(binaria, cv2.MORPH_OPEN, k_clean, iterations=1)
-    
+
     # Encontrar contornos
     contornos, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
+
     # Invertir una sola vez fuera del loop (255=máx intensidad de proteína)
     invertida = cv2.bitwise_not(gris)
 
@@ -93,9 +93,9 @@ def detectar_spots_en_strip(strip_bgr: np.ndarray) -> List[Dict]:
 def mapear_spots_a_grid(spots: List[Dict]) -> List[Dict]:
     """
     Asigna coordenadas (columna, fila) y nombre de proteína a cada spot.
-    Utiliza una cuadrícula geométrica asumiendo que los puntos superior/inferior 
+    Utiliza una cuadrícula geométrica asumiendo que los puntos superior/inferior
     y los laterales definen los bordes del grid biológico.
-    
+
     Layout del array ARY009 (vista frontal):
     - Columna E: izquierda
     - Columna A: derecha
@@ -517,7 +517,9 @@ class AnalizadorGrillaARY009:
     #   A-B, B-C, C-D ≈ 4.5 mm cada uno (espaciado uniforme)
     #   D-E ≈ 7.5 mm (gap mayor porque E es solo columna de referencia)
     #   Total A-E ≈ 21 mm → fracciones: B=4.5/21, C=9/21, D=13.5/21
-    _T_COLS = {'A': 0.0, 'B': 0.21, 'C': 0.43, 'D': 0.64, 'E': 1.0}
+    # Geometria del kit, definida una sola vez en mapa_array.T_COLS
+    # y compartida con gridfit_ary009 para que no puedan divergir.
+    _T_COLS = T_COLS
     # Centroide de los pares de referencia en coordenadas de fila (1-24)
     _FILA_REF_TOP = 1.5    # centro de rows 1 y 2
     _FILA_REF_BOT = 23.5   # centro de rows 23 y 24
@@ -577,13 +579,18 @@ class AnalizadorGrillaARY009:
         if fondo_claro:
             resultado_brillo = self._separar_por_brillo(imagen_gris, n)
 
-        if resultado_brillo is not None and len(resultado_brillo) == n:
+        # _segmentar_proyeccion localiza siempre n segmentos (o devuelve None),
+        # pero descarta los que no tienen ni un pixel de membrana. Ese descarte
+        # NO es un fallo de la estrategia: exigir len == n aqui tiraria a la
+        # basura las tirillas buenas que si se localizaron en esa membrana y
+        # caeria al Black-Hat (o a []) por un hueco que es real.
+        if resultado_brillo:
             logger.info("Separación por contraste de brillo de la membrana.")
             return resultado_brillo
 
         # ── ESTRATEGIA 2: Detección por Black-Hat (spots oscuros) ──
         resultado_bhat = self._separar_por_blackhat(imagen_gris, n, fondo_claro)
-        if resultado_bhat is not None and len(resultado_bhat) == n:
+        if resultado_bhat:
             return resultado_bhat
 
         logger.warning("No se pudieron separar los strips.")
@@ -656,11 +663,16 @@ class AnalizadorGrillaARY009:
     @staticmethod
     def _detectar_n_picos(
         proj: np.ndarray, n: int, x_min: int, x_max: int,
+        perfil_membrana: Optional[np.ndarray] = None,
     ) -> Optional[List[int]]:
         """
         Detecta N picos (máximos locales) en la proyección, dentro del rango
         [x_min, x_max]. Robusto a variaciones de altura: si una tirilla tiene
         señal débil pero genera un máximo local distinto, será detectado.
+
+        perfil_membrana: pixeles de membrana por columna (suma vertical de la
+        mascara). Si se pasa, un candidato que no tenga membrana en su entorno
+        se descarta como ruido y la busqueda SIGUE por el candidato siguiente.
 
         Returns: lista de N posiciones X de los picos, o None si no encuentra
                  exactamente N picos plausibles.
@@ -692,17 +704,65 @@ class AnalizadorGrillaARY009:
         if len(candidatos) < n:
             return None
 
-        # Tomar los N picos más ALTOS
         candidatos.sort(key=lambda c: -c[1])
-        picos_top_n = sorted([c[0] for c in candidatos[:n]])
 
-        # Verificar separación mínima entre picos seleccionados
-        for i in range(len(picos_top_n) - 1):
-            if picos_top_n[i + 1] - picos_top_n[i] < min_dist // 2:
-                return None  # picos demasiado juntos
+        # Seleccion de picos: se recorren los candidatos de mas alto a mas bajo
+        # y se acepta uno solo si (a) tiene membrana debajo y (b) esta separado
+        # de los ya aceptados. El que no cumple se SALTA y la busqueda sigue.
+        #
+        # Modo de falla que evita: antes se tomaban los n candidatos mas altos
+        # y si quedaban demasiado juntos se devolvia None. Dos defectos de eso:
+        #   1. Los maximos locales de una meseta son todos candidatos con la
+        #      MISMA altura, asi que el top-n se llenaba con puntos vecinos de
+        #      una sola membrana (medido: C.mama top-4 = 584,585,586,587) y la
+        #      funcion devolvia None sobre la proyeccion de la mascara, que es
+        #      justo la que esta bien alineada con las membranas.
+        #   2. Al devolver None se caia al fallback de la proyeccion DIRECTA,
+        #      cuyo rango de contenido abarca toda la foto porque el ruido de
+        #      escaneo del borde pasa el umbral. Eso infla min_dist (207 px
+        #      contra un paso real entre membranas de ~128) y la ventana de
+        #      maximos se come membranas reales, ademas de aceptar picos sobre
+        #      el borde vacio (medido: x=101 en C.mama, x=36 en Lineas, x=1019
+        #      en agraz, los tres con 0 pixeles de membrana). Un pico falso
+        #      corre TODOS los limites porque los segmentos se cortan a media
+        #      distancia entre picos: sobre las 6 fotos de prueba eso dejaba 3
+        #      segmentos en vez de 4 (uno caia en el vacio y lo descartaba el
+        #      guardian de abajo) y los vecinos a caballo entre dos membranas
+        #      (Lineas M1 ratio 1.741, C.mama M3 1.568).
+        #
+        # El piso es 5 % del maximo del perfil: la banda de membrana mas debil
+        # de las 6 fotos llega al 8.1 % (C.mama M2 y M4, 18 de 223 px) y todo
+        # lo que cae fuera de las membranas marca exactamente 0 % en las 6.
+        # No es un umbral de aceptacion de tirillas: es la exigencia de que un
+        # "pico" tenga membrana fisica debajo antes de mover ningun limite.
+        piso_cont = 0.0
+        if perfil_membrana is not None and perfil_membrana.size:
+            piso_cont = float(perfil_membrana.max()) * 0.05
+        # Entorno de ~1/3 del paso entre tirillas: el ancho de una membrana,
+        # no el del pasillo entre dos, para que el pico tenga que estar SOBRE
+        # la banda y no al lado de ella.
+        radio_cont = max(2, min_dist // 3)
+        sep_min = max(1, min_dist // 2)
 
-        # Convertir a coordenadas absolutas
-        return [x_min + p for p in picos_top_n]
+        seleccionados: List[int] = []
+        for idx, _altura in candidatos:
+            x_abs = x_min + idx
+            if piso_cont > 0:
+                lo = max(0, x_abs - radio_cont)
+                hi = min(int(perfil_membrana.size), x_abs + radio_cont + 1)
+                if hi <= lo or float(perfil_membrana[lo:hi].max()) < piso_cont:
+                    continue  # ruido de borde: no hay membrana, no es tirilla
+            if any(abs(x_abs - s) < sep_min for s in seleccionados):
+                continue  # mismo pico que uno ya aceptado (meseta o vecino)
+            seleccionados.append(x_abs)
+            if len(seleccionados) == n:
+                break
+
+        if len(seleccionados) != n:
+            return None
+
+        # Ya estan en coordenadas absolutas
+        return sorted(seleccionados)
 
     # ------------------------------------------------------------------
     def _segmentar_proyeccion(
@@ -762,7 +822,18 @@ class AnalizadorGrillaARY009:
         # llamador). Si no encuentra N picos, intentamos con la proyección
         # directa de la imagen invertida (sin morfología agresiva) que
         # preserva mejor las tirillas débiles.
-        picos_detectados = self._detectar_n_picos(proj_norm, n, x_min, x_max)
+        # Evidencia fisica de membrana por columna. Es la MISMA mascara con la
+        # que mas abajo se descarta un segmento sin pixeles de membrana: asi el
+        # pico que se acepta aqui cae donde ese guardian no va a tirar la caja.
+        perfil_membrana = (mask_vertical > 0).sum(axis=0).astype(np.float64)
+
+        picos_detectados = self._detectar_n_picos(proj_norm, n, x_min, x_max,
+                                                  perfil_membrana)
+        # Rango de contenido de la proyeccion de la que salieron los picos que
+        # finalmente ganan. Se guarda aparte porque el reintento de abajo usa
+        # OTRA proyeccion, con su propio rango: recortar los picos de una
+        # proyeccion con los limites de la otra produce cajas invertidas.
+        rango_picos = (x_min, x_max)
 
         if picos_detectados is None or len(picos_detectados) != n:
             # Fallback: proyección sobre la imagen invertida DIRECTA
@@ -779,23 +850,33 @@ class AnalizadorGrillaARY009:
                 xs_cont2 = np.where(proj_dir_norm > proj_dir_norm.max() * 0.03)[0]
                 if xs_cont2.size > 0:
                     xm2, xM2 = int(xs_cont2[0]), int(xs_cont2[-1])
-                    picos_alt = self._detectar_n_picos(proj_dir_norm, n, xm2, xM2)
+                    picos_alt = self._detectar_n_picos(proj_dir_norm, n,
+                                                       xm2, xM2,
+                                                       perfil_membrana)
                     if picos_alt is not None and len(picos_alt) == n:
                         picos_detectados = picos_alt
+                        # Los limites tienen que viajar junto con los picos:
+                        # la proyeccion directa arranca mas afuera que la
+                        # suavizada, y usar x_min/x_max aqui empujaba el borde
+                        # de la primera tirilla por delante de su propio final
+                        # (o el de la ultima por detras de su inicio), dejando
+                        # un recorte de ancho negativo -> tirilla vacia.
+                        rango_picos = (xm2, xM2)
                         logger.info("Picos detectados sobre proyección directa (más sensible).")
         if picos_detectados is not None and len(picos_detectados) == n:
             # Construir segmentos centrados en los picos
             # Cada segmento se extiende a mitad de camino al pico vecino
             segs_picos = []
             picos = sorted(picos_detectados)
+            px_min, px_max = rango_picos
             for i, pico in enumerate(picos):
                 if i == 0:
                     # primer strip: desde inicio hasta media distancia al siguiente
-                    x0 = max(x_min, pico - (picos[1] - pico) // 2) if len(picos) > 1 else x_min
+                    x0 = max(px_min, pico - (picos[1] - pico) // 2) if len(picos) > 1 else px_min
                 else:
                     x0 = (picos[i - 1] + pico) // 2
                 if i == len(picos) - 1:
-                    x1 = min(x_max, pico + (pico - picos[-2]) // 2) if len(picos) > 1 else x_max
+                    x1 = min(px_max, pico + (pico - picos[-2]) // 2) if len(picos) > 1 else px_max
                 else:
                     x1 = (pico + picos[i + 1]) // 2
                 segs_picos.append((x0, x1))
@@ -871,19 +952,75 @@ class AnalizadorGrillaARY009:
             mg_x = max(0, min(span // (n * 10), min_gap // 3))
 
         strips = []
-        for x0, x1 in final_segs:
+        for i_seg, (x0, x1) in enumerate(final_segs):
             x0 = max(0, x0 - mg_x)
             x1 = min(w, x1 + mg_x)
 
             col_mask = mask_vertical[:, x0:x1]
+
+            # Recorte en X al contenido real de la mascara: el equivalente del
+            # recorte en Y que se hace unas lineas mas abajo con proj_y/rows.
+            # Se aplica a LOS DOS BORDES DE TODAS las tirillas.
+            # Modo de falla que evita: ningun borde de segmento conoce el ancho
+            # real de la membrana que encierra. El exterior sale de
+            # "pico -/+ media distancia al vecino" clampeado contra px_min/px_max,
+            # y el interior es el punto medio entre dos picos, que reparte 50/50
+            # el pasillo vacio entre dos membranas: las dos cajas se quedan con
+            # media calle de fondo. En ambos casos la caja se estira sobre
+            # membrana vacia, y el ajuste de grilla ancla las referencias una
+            # columna corrida y varias filas por encima del par real.
+            # Medido: en SW480-Aspirina M1 el borde izquierdo (exterior) sobraba
+            # 33 px y row_spacing caia de 9.9 a 7.7 px (relacion de celda
+            # 1.335 -> 1.698, grilla comprimida 22 % y 5 filas de spots sin
+            # cubrir, incluido el A23/A24 verdadero, con el PBS cayendo sobre
+            # senal real). El mismo defecto en bordes INTERIORES mantenia
+            # SW480-Aspirina M2 en ratio 1.701 y Sw480-agraz M3 en 1.714 -- dos
+            # tirillas entregando 37 proteinas sobre grilla mal puesta -- y
+            # recortarlos las baja a 1.390 y 1.391. Por eso no alcanza con los
+            # bordes exteriores: la cuenta de tirillas SANAS sube al recortar
+            # los cuatro lados.
+            # SOLO ENCOGE: si el ajuste quisiera ampliar la caja se deja como
+            # esta, porque ampliar es justamente el defecto.
+            proj_x = (col_mask > 0).sum(axis=0)
+            cols_c = np.where(proj_x > 0)[0]
+            if cols_c.size:
+                # Mismo margen que el recorte en Y de abajo (max(15, 6 %)):
+                # la mascara marca spots, no la membrana entera, asi que
+                # el contenido termina en el borde del spot de la columna
+                # exterior y hace falta dejarle el reborde de membrana.
+                # Con menos de ~12 px el recorte empezaria a morder el
+                # borde derecho de las dos membranas que hoy van 4/4.
+                mg_xc = max(15, int((cols_c[-1] - cols_c[0]) * 0.06))
+                nx0 = max(x0, x0 + int(cols_c[0]) - mg_xc)
+                nx1 = min(x1, x0 + int(cols_c[-1]) + 1 + mg_xc)
+                if (nx0, nx1) != (x0, x1) and nx1 - nx0 >= 20:
+                    logger.info(
+                        f"Strip {i_seg+1}: caja encogida al "
+                        f"contenido x=[{x0},{x1}] -> x=[{nx0},{nx1}]."
+                    )
+                    x0, x1 = nx0, nx1
+                    col_mask = mask_vertical[:, x0:x1]
+
             proj_y = col_mask.astype(np.float64).sum(axis=1)
             rows = np.where(proj_y > 0)[0]
             if rows.size == 0:
-                y0, y1 = 0, h
-            else:
-                mg_y = max(15, int((rows[-1] - rows[0]) * 0.06))
-                y0 = max(0, int(rows[0]) - mg_y)
-                y1 = min(h, int(rows[-1]) + mg_y)
+                # En este rango de x la mascara no tiene NI UN pixel de
+                # membrana: aqui no hay tirilla que recortar. Recortar la foto
+                # completa (y0,y1 = 0,h) fabricaba una "tirilla" de ruido de
+                # escaneo -- 0.00% de pixeles oscuros, contra 0.8-6.2% en una
+                # membrana real -- que encontrar_referencias llegaba a aceptar
+                # y entregaba 37 proteinas inventadas sobre el fondo. Sin
+                # membrana no hay dato: el segmento se descarta y la lista sale
+                # con menos de n (separar_strips y analizar_imagen lo toleran).
+                logger.warning(
+                    f"Segmento x=[{x0},{x1}]: sin pixeles de membrana en la "
+                    f"mascara, se descarta (no se recorta la imagen completa)."
+                )
+                continue
+
+            mg_y = max(15, int((rows[-1] - rows[0]) * 0.06))
+            y0 = max(0, int(rows[0]) - mg_y)
+            y1 = min(h, int(rows[-1]) + mg_y)
 
             strips.append((imagen_gris[y0:y1, x0:x1], (x0, y0, x1 - x0, y1 - y0)))
 
@@ -922,6 +1059,10 @@ class AnalizadorGrillaARY009:
         spots_todos = self._detectar_todos_los_spots(strip_gris)
         spots_xy = (np.array([[s[0], s[1]] for s in spots_todos], dtype=np.float32)
                     if spots_todos else np.empty((0, 2), dtype=np.float32))
+        # Se guardan para que _asignar_anchors pueda centrar cada ancla en su
+        # PAR de duplicados. Las tres estrategias desembocan ahí y ninguna
+        # recibe la lista de spots, pero aquí ya está calculada una sola vez.
+        self._spots_para_anclas = spots_todos
 
         h, w = strip_gris.shape
 
@@ -942,6 +1083,21 @@ class AnalizadorGrillaARY009:
             if refs is None or spots_xy.size == 0:
                 return False
 
+            # Forma de la celda ANTES que nada: unos anclajes que describen un
+            # grid imposible no sirven por muy bien que caigan sobre spots.
+            # Va antes del CASO 1 a propósito — ese atajo aceptaba candidatos
+            # con la geometría rota solo porque las 3 anclas tocaban un spot,
+            # y así ganaba el primer candidato malo en vez de seguir probando
+            # las estrategias siguientes, que suelen acertar.
+            cs_cand, rs_cand, ratio_cand = self._ratio_celda(refs)
+            if not (self.RATIO_CELDA_MIN <= ratio_cand <= self.RATIO_CELDA_MAX):
+                logger.info(
+                    f"  Val geom: celda {cs_cand:.1f}x{rs_cand:.1f}px "
+                    f"(relación {ratio_cand:.2f}, esperada "
+                    f"{self.RATIO_CELDA_MIN}-{self.RATIO_CELDA_MAX}) → RECHAZADO"
+                )
+                return False
+
             # Calcular distancia de cada anchor al spot más cercano
             radio_ancla = max(8, int(w * 0.12))
             dist_ancla_max = 0.0
@@ -957,11 +1113,49 @@ class AnalizadorGrillaARY009:
                     return False
                 dist_ancla_max = max(dist_ancla_max, dist_min)
 
+            # COBERTURA: qué fracción de los spots detectados queda explicada
+            # por alguna posición del grid. Es la prueba de que las anclas
+            # describen ESTA membrana y no una desplazada que casualmente
+            # apoya sus 3 esquinas sobre spots reales.
+            cs_ref, rs_ref, _ = self._ratio_celda(refs)
+            tol_cob_sq = (max(cs_ref, rs_ref) * 0.50) ** 2
+            tl_c, tr_c, bl_c = refs
+            fila_span_c = self._FILA_REF_BOT - self._FILA_REF_TOP
+            grid_pts = []
+            for (col_c, fila_c) in MAPA_PROTEINAS:
+                t_col = self._T_COLS[col_c]
+                t_row = (fila_c - self._FILA_REF_TOP) / fila_span_c
+                x_A = tl_c[0] + t_row * (bl_c[0] - tl_c[0])
+                grid_pts.append((x_A + t_col * (tr_c[0] - tl_c[0]),
+                                 tl_c[1] + t_row * (bl_c[1] - tl_c[1])))
+            grid_arr = np.array(grid_pts, dtype=np.float32)
+            n_explicados = 0
+            for sx_c, sy_c in spots_xy:
+                ddx = grid_arr[:, 0] - sx_c
+                ddy = grid_arr[:, 1] - sy_c
+                if float((ddx * ddx + ddy * ddy).min()) <= tol_cob_sq:
+                    n_explicados += 1
+            cobertura = n_explicados / len(spots_xy)
+
             # CASO 1: anclas perfectas (todas a <5px de un spot real)
             # → aceptar sin más validación (muestra puede ser débil)
             if dist_ancla_max < 5.0:
-                logger.info(f"  Val OK: anclas perfectas (max dist={dist_ancla_max:.1f}px)")
-                return True
+                # El atajo existe para membranas tenues, donde hay tan pocos
+                # spots que ninguna validación de grid significa nada. Pero si
+                # hay spots de sobra, el grid tiene que explicarlos: unas anclas
+                # que tocan 3 spots e ignoran otros 43 describen una grilla
+                # desplazada, no una muestra débil.
+                if len(spots_xy) < 15 or cobertura >= 0.35:
+                    logger.info(
+                        f"  Val OK: anclas perfectas (max dist={dist_ancla_max:.1f}px, "
+                        f"cobertura {cobertura:.0%} de {len(spots_xy)} spots)"
+                    )
+                    return True
+                logger.info(
+                    f"  Val cobertura: anclas perfectas pero el grid solo explica "
+                    f"{cobertura:.0%} de {len(spots_xy)} spots → RECHAZADO"
+                )
+                return False
 
             # 2. Calcular posiciones del grid y contar matches POR COLUMNA
             tl, tr, bl = refs
@@ -1051,6 +1245,27 @@ class AnalizadorGrillaARY009:
         resultado = self._referencias_legacy(strip_gris)
         if _aceptar(resultado):
             return resultado
+
+        # Estrategia 5 (último recurso): ajuste rígido guiado por TODOS los
+        # spots, en vez de por 3 anclas. Las 4 estrategias anteriores buscan
+        # primero los Reference Spots y derivan la grilla de ellos; cuando la
+        # membrana está inclinada o corrida esa búsqueda falla y la tirilla se
+        # perdía entera. Aquí se hace al revés: se ajusta la retícula completa
+        # (traslación, escala, rotación — la topología nunca se deforma) contra
+        # la nube de spots detectados, y las referencias se DEDUCEN del ajuste.
+        # Va de últimas a propósito: donde las otras funcionan, no se toca nada.
+        logger.info("Probando ajuste rígido guiado por spots (gridfit).")
+        try:
+            par, _info = gridfit_ary009.ajustar_ary009(
+                spots_todos, strip_gris, rs_prior=strip_gris.shape[0] / 24.0,
+            )
+            if par is not None:
+                resultado = gridfit_ary009.par_a_refs(par)
+                if _aceptar(resultado):
+                    logger.info("Referencias recuperadas por gridfit.")
+                    return resultado
+        except Exception as e:
+            logger.warning(f"gridfit falló: {e}")
 
         # Ninguna estrategia produjo un grid-fit aceptable
         logger.warning("Ninguna estrategia produjo referencias con grid válido. "
@@ -1320,15 +1535,86 @@ class AnalizadorGrillaARY009:
         return self._asignar_anchors(tl_c, tr_c, bp)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _clahe_tile_size(h: int, w: int) -> int:
+        """Tile size adaptativo para CLAHE: evita artefactos en strips pequeños."""
+        return max(4, min(8, h // 16, w // 4))
+
+    @staticmethod
+    def _asignar_spots_uno_a_uno(
+        geo_posiciones: Dict[Tuple[str, int], Tuple[int, int]],
+        spots_detectados: List[Tuple[float, float, float]],
+        max_snap_x: float,
+        max_snap_y: float,
+        area_min_snap: float,
+    ) -> Dict[Tuple[str, int], Tuple[int, int]]:
+        """
+        Empareja posiciones de la grilla con spots detectados, 1 a 1.
+
+        Cada posición recibe como máximo un spot, y cada spot se entrega a
+        como máximo una posición. Esto es lo que impide que dos proteínas
+        distintas reclamen el mismo blob: antes el snap se resolvía posición
+        por posición, sin memoria de lo ya tomado, y las dos terminaban
+        reportando la misma intensidad inventada.
+
+        Estrategia: generar todos los pares (posición, spot) que caen dentro
+        de la ventana de búsqueda, ordenarlos por costo y asignarlos de menor
+        a mayor, saltando los que ya tienen dueño. El costo es la distancia al
+        cuadrado más una penalización para los spots de área pequeña
+        (probable ruido), igual que el snap anterior.
+
+        Las posiciones sin spot asignado NO aparecen en el resultado: el
+        llamador las deja en su coordenada geométrica.
+        """
+        if not spots_detectados:
+            return {}
+
+        candidatos = []
+        for k, (px, py) in geo_posiciones.items():
+            for idx, (sx, sy, sa) in enumerate(spots_detectados):
+                dx = abs(sx - px)
+                dy = abs(sy - py)
+                if dx > max_snap_x or dy > max_snap_y:
+                    continue
+                score = dx * dx + dy * dy
+                if sa < area_min_snap:
+                    score += ((area_min_snap - sa) / area_min_snap) * (max_snap_x ** 2)
+                candidatos.append((score, k, idx))
+
+        # Orden estable: el costo manda, y ante empate decide la coordenada
+        # de grilla para que dos corridas sobre la misma imagen coincidan.
+        candidatos.sort(key=lambda t: (t[0], t[1], t[2]))
+
+        asignacion: Dict[Tuple[str, int], Tuple[int, int]] = {}
+        spots_usados = set()
+        for _score, k, idx in candidatos:
+            if k in asignacion or idx in spots_usados:
+                continue
+            sx, sy, _sa = spots_detectados[idx]
+            asignacion[k] = (int(round(sx)), int(round(sy)))
+            spots_usados.add(idx)
+        return asignacion
+
+    @staticmethod
+    def _nearest_spot(
+        spots_xy: np.ndarray, px: float, py: float,
+    ) -> Tuple[int, float]:
+        """Índice y dist² del spot más cercano a (px, py) en spots_xy (N×2)."""
+        dx = spots_xy[:, 0] - px
+        dy = spots_xy[:, 1] - py
+        d_sq = dx * dx + dy * dy
+        min_idx = int(np.argmin(d_sq))
+        return min_idx, float(d_sq[min_idx])
+
+    # ------------------------------------------------------------------
     def _detectar_spots_para_referencias(
         self, strip_gris: np.ndarray, estricto: bool = True,
     ) -> List[Dict]:
         """Detecta candidatos a Reference Spot con filtros configurables."""
         h, w = strip_gris.shape
 
-        # CLAHE: tile size adaptativo al tamaño del strip
-        # Para strips pequeños, tiles grandes (menos tiles) para evitar artefactos
-        tile_size = max(4, min(8, h // 16, w // 4))
+        # tile size adaptativo: strips pequeños → tiles más grandes para evitar artefactos
+        tile_size = self._clahe_tile_size(h, w)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_size, tile_size))
         eq = clahe.apply(strip_gris)
 
@@ -1631,6 +1917,73 @@ class AnalizadorGrillaARY009:
         return None
 
     # ------------------------------------------------------------------
+    # Relación col_spacing / row_spacing medida en las membranas ARY009 bien
+    # ancladas del set de prueba: 1.29–1.71, estable de 1x a 4x. Es una
+    # propiedad del kit (la separación entre columnas es ~1.3 veces la
+    # separación entre filas), no del encuadre, así que detecta anclajes
+    # imposibles sin depender de la escala, el recorte ni la inclinación.
+    RATIO_CELDA_MIN = 0.90
+    RATIO_CELDA_MAX = 2.20
+
+    @staticmethod
+    def _ratio_celda(
+        refs: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
+    ) -> Tuple[float, float, float]:
+        """
+        Devuelve (col_spacing, row_spacing, ratio) de unos anclajes.
+        ratio vale 0.0 si la geometría es degenerada (algún spacing nulo).
+        """
+        tl, tr, bl = refs
+        col_spacing = abs(tr[0] - tl[0]) / 4.0
+        row_spacing = abs(bl[1] - tl[1]) / 22.0
+        if col_spacing <= 0 or row_spacing <= 0:
+            return col_spacing, row_spacing, 0.0
+        return col_spacing, row_spacing, col_spacing / row_spacing
+
+    @classmethod
+    def _geometria_plausible(
+        cls,
+        refs: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
+        n_strip: int,
+    ) -> bool:
+        """
+        Rechaza anclajes que no pueden corresponder a una membrana ARY009.
+
+        Cuando la detección de Reference Spots se equivoca, el grid resultante
+        es geométricamente imposible pero el motor lo usa igual y entrega
+        números con apariencia normal. Dos modos de falla observados:
+
+          - Anclas superiores demasiado juntas → las 5 columnas colapsan sobre
+            la misma X y varias proteínas miden el mismo spot.
+          - Anclas superiores demasiado separadas → el grid se abre más que la
+            membrana y las columnas de los bordes caen fuera de los spots.
+
+        Ambos se detectan por la forma de la celda (col_spacing / row_spacing),
+        que en una membrana real vale ~1.3 sin importar el tamaño de la foto.
+        """
+        col_spacing, row_spacing, ratio = cls._ratio_celda(refs)
+
+        if ratio == 0.0:
+            logger.warning(
+                f"Strip {n_strip}: anclajes degenerados "
+                f"(col_spacing={col_spacing:.1f}px, row_spacing={row_spacing:.1f}px). "
+                f"Se descarta la tirilla."
+            )
+            return False
+
+        if not (cls.RATIO_CELDA_MIN <= ratio <= cls.RATIO_CELDA_MAX):
+            forma = "columnas colapsadas" if ratio < cls.RATIO_CELDA_MIN else "columnas sobre-extendidas"
+            logger.warning(
+                f"Strip {n_strip}: geometría inválida — {forma}. "
+                f"La celda mide {col_spacing:.1f}x{row_spacing:.1f}px (relación {ratio:.2f}, "
+                f"se esperaba entre {cls.RATIO_CELDA_MIN} y {cls.RATIO_CELDA_MAX}). "
+                f"Los Reference Spots se detectaron mal: las intensidades de esta "
+                f"tirilla no serían confiables. Recalibre manualmente."
+            )
+            return False
+        return True
+
+    # ------------------------------------------------------------------
     def _asignar_anchors(
         self, top_left: Dict, top_right: Dict, bot_pair: Dict,
     ) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
@@ -1653,12 +2006,80 @@ class AnalizadorGrillaARY009:
             bl = (bot_pair['cx'], bot_pair['cy'])
             logger.info("Orientación: col A en la DERECHA del strip.")
 
+        tl, tr, bl = self._centrar_en_pares(tl, tr, bl)
+
         logger.info(
             f"Referencias: TL=({tl[0]:.0f},{tl[1]:.0f})  "
             f"TR=({tr[0]:.0f},{tr[1]:.0f})  "
             f"BL=({bl[0]:.0f},{bl[1]:.0f})"
         )
         return (tl, tr, bl)
+
+    # ------------------------------------------------------------------
+    def _centrar_en_pares(self, tl, tr, bl):
+        """Lleva cada ancla al centro de su PAR de duplicados.
+
+        Las 3 anclas del ARY009 son pares verticales (A1/A2, E1/E2, A23/A24) y
+        _pos_pixel las espera en el CENTRO del par: _FILA_REF_TOP = 1.5 y
+        _FILA_REF_BOT = 23.5. Cuando los dos spots del par se fusionan en un
+        blob, su centroide ya es ese centro. Pero si el par sale como dos blobs
+        separados —pasa cuando el valle entre ellos es profundo, o cuando uno
+        de los dos está tenue— la estrategia elige UNO y el ancla queda media
+        fila corrida.
+
+        Esa media fila no la delata la relación de celda: la grilla conserva su
+        forma y sigue dando ~1.3. Lo que sí se rompe es que el compañero del
+        par se desploma (A23 medido en 13.5 contra A24 en 54.2), el PBS D23/D24
+        se monta sobre la cola del spot de arriba y se resta como fondo a las
+        35 proteínas, y el paso de fila se descuadra hasta colapsar dos filas
+        en el mismo píxel. Era el estado de Sw620 colon-mango M2.
+
+        El arreglo se apoya en que el detector general de spots SÍ encuentra el
+        par fusionado: en Sw620 M2 hay un spot de área 144 en y=301.7 (el
+        centro real del par) a 5.5 px del ancla que la estrategia había puesto
+        en y=296.2 (el centro de un solo spot). Las estrategias de referencias
+        usan su propio detector y pueden quedarse con un sub-blob.
+
+        Así que entre los spots cercanos al ancla se elige el de MAYOR ÁREA: un
+        par fusionado mide más que uno de sus dos spots sueltos. Si el ancla ya
+        estaba sobre el par, el mayor cercano es él mismo y no se mueve nada.
+        """
+        spots = getattr(self, '_spots_para_anclas', None)
+        if not spots:
+            return tl, tr, bl
+
+        # Paso de fila a partir de las propias anclas: van de la fila 1.5 a la
+        # 23.5, o sea 22 pasos.
+        rs = abs(bl[1] - tl[1]) / 22.0
+        if rs <= 0:
+            return tl, tr, bl
+        # Radio de búsqueda por debajo de 1 paso de fila, para no poder saltar
+        # nunca al par de otra fila, y por debajo de media celda en horizontal,
+        # para no invadir la columna vecina (col_spacing es ~1.3 rs).
+        tol_y = rs * 0.75
+        tol_x = rs * 0.55
+
+        def centrar(anc, nombre):
+            ax, ay = anc
+            mejor = None
+            for sx, sy, area in spots:
+                if abs(sx - ax) > tol_x or abs(sy - ay) > tol_y:
+                    continue
+                if mejor is None or area > mejor[0]:
+                    mejor = (area, sx, sy)
+            if mejor is None:
+                return anc
+            area, sx, sy = mejor
+            if abs(sx - ax) < 0.5 and abs(sy - ay) < 0.5:
+                return anc
+            logger.info(
+                f"  Ancla {nombre} enganchada al blob del par: "
+                f"({ax:.0f},{ay:.0f}) -> ({sx:.0f},{sy:.0f}) "
+                f"(area={area:.0f}, paso de fila {rs:.1f}px)"
+            )
+            return (sx, sy)
+
+        return centrar(tl, 'TL'), centrar(tr, 'TR'), centrar(bl, 'BL')
 
     # ------------------------------------------------------------------
     def _pos_pixel(
@@ -1836,6 +2257,24 @@ class AnalizadorGrillaARY009:
             else:
                 mascara_combinada = cv2.bitwise_or(mascara_combinada, m)
 
+        # Fallback para imágenes de bajo contraste: si no se detectó nada o muy poco,
+        # intentar de nuevo con CLAHE que amplifica el contraste local.
+        n_detectados = 0 if mascara_combinada is None else int(cv2.countNonZero(mascara_combinada))
+        if n_detectados < 5:
+            tile_size = self._clahe_tile_size(h_strip, w_strip)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(tile_size, tile_size))
+            gris_clahe = clahe.apply(gris_8)
+            for k_size in kernels_sizes:
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+                bhat = cv2.morphologyEx(gris_clahe, cv2.MORPH_BLACKHAT, kernel)
+                if bhat.max() < 2:
+                    continue
+                umbral = max(1.5, float(bhat.max()) * 0.06)
+                _, m = cv2.threshold(bhat, umbral, 255, cv2.THRESH_BINARY)
+                mascara_combinada = m if mascara_combinada is None else cv2.bitwise_or(mascara_combinada, m)
+            if mascara_combinada is not None and cv2.countNonZero(mascara_combinada) > n_detectados:
+                logger.info("Spots: fallback CLAHE activado (contraste bajo en Black-Hat estándar)")
+
         if mascara_combinada is None:
             return []
 
@@ -1884,27 +2323,50 @@ class AnalizadorGrillaARY009:
         Aplica safeguards para que la transformación no distorsione la grilla:
           - Escala entre 0.85 y 1.15
           - Rotación máxima ±15°
-          - Requiere al menos 8 correspondencias válidas
+          - Requiere al menos 8 spots para la vía afín; con 3-7 spots
+            degrada a traslación pura por mediana
         """
-        if len(spots) < 8:
+        if len(spots) < 3:
             return pos_dict
 
         spots_xy = np.array([[s[0], s[1]] for s in spots], dtype=np.float32)
-        # Radio de búsqueda del ICP: 50% del mayor espaciado (fila o columna).
-        # Más amplio que el snap local porque el ICP trabaja antes de snap final.
         max_dist = max(row_spacing, col_spacing) * 0.50
         max_dist_sq = max_dist * max_dist
 
         pos = dict(pos_dict)
 
+        # Con menos de 8 spots no hay suficiente información para una transformación
+        # afín robusta. Hacemos solo traslación: la mediana del desplazamiento de
+        # cada posición grilla al spot real más cercano.
+        if len(spots) < 8:
+            shifts_x, shifts_y = [], []
+            for (col, fila), (px, py) in pos.items():
+                min_idx, dist_sq = self._nearest_spot(spots_xy, px, py)
+                if dist_sq < max_dist_sq:
+                    shifts_x.append(float(spots_xy[min_idx, 0] - px))
+                    shifts_y.append(float(spots_xy[min_idx, 1] - py))
+            if len(shifts_x) >= 3:
+                tx = float(np.median(shifts_x))
+                ty = float(np.median(shifts_y))
+                # Limitar a 30% del espaciado para evitar saltos bruscos
+                max_t = max(row_spacing, col_spacing) * 0.30
+                tx = float(np.clip(tx, -max_t, max_t))
+                ty = float(np.clip(ty, -max_t, max_t))
+                if abs(tx) > 0.5 or abs(ty) > 0.5:
+                    logger.info(
+                        f"ICP fallback traslación ({tx:+.1f}, {ty:+.1f}) px "
+                        f"— {len(shifts_x)} matches con {len(spots)} spots"
+                    )
+                    for k in list(pos.keys()):
+                        pos[k] = (int(round(pos[k][0] + tx)),
+                                  int(round(pos[k][1] + ty)))
+            return pos
+
         for _ in range(max_iter):
             src_list, dst_list = [], []
             for (col, fila), (px, py) in pos.items():
-                dx = spots_xy[:, 0] - px
-                dy = spots_xy[:, 1] - py
-                d_sq = dx * dx + dy * dy
-                min_idx = int(np.argmin(d_sq))
-                if d_sq[min_idx] < max_dist_sq:
+                min_idx, dist_sq = self._nearest_spot(spots_xy, px, py)
+                if dist_sq < max_dist_sq:
                     src_list.append([float(px), float(py)])
                     dst_list.append([float(spots_xy[min_idx, 0]),
                                       float(spots_xy[min_idx, 1])])
@@ -1971,15 +2433,17 @@ class AnalizadorGrillaARY009:
             return 0.0
         spot_signal = float(roi.mean())
 
-        # Anillo de fondo: 3× el radio, excluyendo el spot
+        # Fondo: franja horizontal (mismo Y que el spot, píxeles a izquierda y derecha).
+        # Evita incluir spots de filas adyacentes del mismo columna — en ARY009 cada
+        # proteína ocupa 2 filas consecutivas separadas ~row_spacing px, y el bg_r
+        # vertical cruzaría ese spot vecino, inflando bg_signal y bajando calidad.
         bg_r = r * 3
-        bx0, bx1 = max(0, px - bg_r), min(w, px + bg_r)
-        by0, by1 = max(0, py - bg_r), min(h, py + bg_r)
-        bg_region = inv_img[by0:by1, bx0:bx1]
-        if bg_region.size == 0:
+        bg_left  = inv_img[y0:y1, max(0, px - bg_r):max(0, px - r)]
+        bg_right = inv_img[y0:y1, min(w, px + r):min(w, px + bg_r)]
+        bg_parts = [a for a in (bg_left, bg_right) if a.size > 0]
+        if not bg_parts:
             return 0.5
-        # Estimar fondo con percentil bajo (lo más oscuro del entorno = fondo)
-        bg_signal = float(np.percentile(bg_region, 25))
+        bg_signal = float(np.percentile(np.concatenate([p.ravel() for p in bg_parts]), 25))
 
         contrast = spot_signal - bg_signal
         # Normalizar: contraste >= 25 → calidad 1.0; <= 3 → calidad 0
@@ -2223,13 +2687,28 @@ class AnalizadorGrillaARY009:
                 return int(round(mejor_spot[0])), int(round(mejor_spot[1]))
             return px, py
 
-        # ── PASADA 1: posición geométrica + mean-shift + snap global ──
+        # ── PASADA 1: posición geométrica + snap global ──
+        # Guardamos geo_posiciones antes del snap para poder revertir duplicados.
         posiciones: Dict[Tuple[str, int], Tuple[int, int]] = {}
+        geo_posiciones: Dict[Tuple[str, int], Tuple[int, int]] = {}
         for (col, fila), proteina in MAPA_PROTEINAS.items():
-            px, py = self._pos_pixel(col, fila, tl, tr, bl, pbs_bot,
-                                       img_inv=inv, rx=rx_safe, ry=ry_safe)
-            px, py = _snap_a_spot_cercano(px, py)
-            posiciones[(col, fila)] = (px, py)
+            gx, gy = self._pos_pixel(col, fila, tl, tr, bl, pbs_bot,
+                                     img_inv=inv, rx=rx_safe, ry=ry_safe)
+            geo_posiciones[(col, fila)] = (gx, gy)
+
+        # Asignación global 1-a-1 en vez de snap posición por posición: dos
+        # proteínas ya no pueden quedarse con el mismo spot. Las posiciones sin
+        # spot asignado conservan su coordenada geométrica.
+        asignacion = self._asignar_spots_uno_a_uno(
+            geo_posiciones, spots_detectados,
+            max_snap_x, max_snap_y, area_min_snap,
+        )
+        for k, geo in geo_posiciones.items():
+            posiciones[k] = asignacion.get(k, geo)
+        logger.info(
+            f"Asignación 1-a-1: {len(asignacion)}/{len(geo_posiciones)} posiciones "
+            f"con spot propio ({len(spots_detectados)} spots detectados)"
+        )
 
         # ── PASADA 2: consistencia por filas (Y) y columnas (X) ──
         # Tolerancias algo amplias para no forzar spots que se anclaron
@@ -2256,24 +2735,64 @@ class AnalizadorGrillaARY009:
             posiciones, spots_detectados, row_spacing, col_spacing,
         )
 
-        # ── PASADA 3: re-snap final desde posición refinada ──
-        # Marcar cuáles posiciones SE SNAPEARON a un spot real (vs cuáles no)
-        spots_set = set()
-        for sx, sy, _sa in spots_detectados:
-            spots_set.add((int(round(sx)), int(round(sy))))
-
-        snapeadas = set()  # coords (col, fila) que se snapearon a un spot real
-        for k, (px, py) in list(posiciones.items()):
-            nueva = _snap_a_spot_cercano(px, py)
-            posiciones[k] = nueva
-            if nueva in spots_set:
+        # ── PASADA 3: re-asignación final 1-a-1 desde la posición refinada ──
+        # Tiene que ser 1-a-1 igual que la PASADA 1: si aquí se volviera a
+        # snapear posición por posición, dos proteínas podrían reclamar de
+        # nuevo el mismo spot y se perdería lo ganado antes del ICP.
+        asignacion_final = self._asignar_spots_uno_a_uno(
+            posiciones, spots_detectados,
+            max_snap_x, max_snap_y, area_min_snap,
+        )
+        snapeadas = set()  # coords (col, fila) que quedaron sobre un spot real
+        for k in list(posiciones.keys()):
+            nueva = asignacion_final.get(k)
+            if nueva is not None:
+                posiciones[k] = nueva
                 snapeadas.add(k)
+
+        # ── DEDUPLICACIÓN post-snap: filas consecutivas del mismo columna ──
+        # Si dos posiciones contiguas (e.g. D9 y D10, duplicados del mismo proteína)
+        # snapearon al mismo blob, la y_mediano_fila de PASADA 4 usará ese Y único
+        # para DOS filas distintas → todas las posiciones de ambas filas colapsan.
+        # Fix: revertir el que se alejó más de la posición geométrica.
+        for col in sorted(set(c for c, _ in MAPA_PROTEINAS.keys())):
+            filas_col = sorted(
+                f for c, f in MAPA_PROTEINAS.keys()
+                if c == col and (c, f) not in coords_ancladas
+            )
+            for i in range(len(filas_col) - 1):
+                f1, f2 = filas_col[i], filas_col[i + 1]
+                if f2 != f1 + 1:
+                    continue
+                k1, k2 = (col, f1), (col, f2)
+                # Los duplicados ARY009 son pares (1,2)=Bad, (3,4)=Bax, ...
+                # Recorrer filas consecutivas genera tambien pares solapados
+                # como (2,3), que son proteinas DISTINTAS: esas no se deduplican,
+                # revertirlas destruiria una posicion legitima.
+                if MAPA_PROTEINAS.get(k1) != MAPA_PROTEINAS.get(k2):
+                    continue
+                if k1 not in posiciones or k2 not in posiciones:
+                    continue
+                px1, py1 = posiciones[k1]
+                px2, py2 = posiciones[k2]
+                if abs(px1 - px2) <= 2 and abs(py1 - py2) <= 2:
+                    gx1, gy1 = geo_posiciones[k1]
+                    gx2, gy2 = geo_posiciones[k2]
+                    d1 = (px1 - gx1) ** 2 + (py1 - gy1) ** 2
+                    d2 = (px2 - gx2) ** 2 + (py2 - gy2) ** 2
+                    if d1 >= d2:
+                        posiciones[k1] = (gx1, gy1)
+                        snapeadas.discard(k1)
+                    else:
+                        posiciones[k2] = (gx2, gy2)
+                        snapeadas.discard(k2)
 
         # ── PASADA 4: AUTO-CORRECCIÓN por columna/fila usando spots snapeados ──
         # IDEA: las posiciones que SÍ se snapearon nos dicen dónde está REALMENTE
         # cada columna y fila en esta imagen. Las que NO se snapearon (porque el
         # spot es invisible o muy débil) deben usar ese mismo X / Y para no
         # quedar desalineadas del resto.
+        x_mediano_col: Dict[str, int] = {}
         if snapeadas:
             # X mediano por columna (solo usando posiciones snapeadas)
             from collections import defaultdict
@@ -2301,6 +2820,20 @@ class AnalizadorGrillaARY009:
                 if fila in y_mediano_fila:
                     nuevo_py = y_mediano_fila[fila]
                 posiciones[k] = (nuevo_px, nuevo_py)
+
+            # Corrección de posiciones snapeadas que se desviaron demasiado del
+            # X mediano de su columna: probable snap a blob incorrecto en X.
+            # Solo corrige outliers claros (> 25% del col_spacing).
+            umbral_x_outlier = max(3, int(col_spacing * 0.25))
+            for k, (px, py) in list(posiciones.items()):
+                if k in coords_ancladas:
+                    continue
+                col, fila = k
+                if col not in x_mediano_col:
+                    continue
+                if abs(px - x_mediano_col[col]) > umbral_x_outlier:
+                    posiciones[k] = (x_mediano_col[col], py)
+                    snapeadas.discard(k)
 
         # ── PASADA 5: Centrado fino ULTRA-CONSERVADOR ──
         # Para cada posición YA snapeada a un spot real, hacer un micro-ajuste
@@ -2441,6 +2974,40 @@ class AnalizadorGrillaARY009:
         return int(round(cx)), int(round(cy))
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _promediar_duplicados(
+        acum: Dict[str, List[float]],
+    ) -> Tuple[Dict[str, float], List[str]]:
+        """
+        Promedia los duplicados de cada proteína.
+        Cuando los dos duplicados difieren más de 2.5× y el mayor supera 15,
+        se sigue usando el PROMEDIO (como indica el kit) pero la proteína se
+        devuelve en la lista de discordantes para marcarla como baja confianza.
+
+        Returns: (intensidades, lista_de_proteinas_discordantes)
+        """
+        resultado: Dict[str, float] = {}
+        discordantes: List[str] = []
+        for proteina, valores in acum.items():
+            # Los controles se promedian SIEMPRE. En PBS (control negativo)
+            # quedarse con el maximo invierte su sentido, y pbs_val se resta
+            # a las 35 proteinas en cuantificar(): un PBS inflado recorta
+            # todo el strip a la vez.
+            if len(valores) == 2 and proteina not in ("PBS", "Reference"):
+                v_max, v_min = max(valores), min(valores)
+                if v_max >= 15 and v_min < v_max * 0.40:
+                    # Antes se usaba el máximo, lo que sesga hacia arriba.
+                    # Ahora se promedia (método del kit) y se MARCA como baja
+                    # confianza: tanta diferencia suele indicar grilla corrida.
+                    discordantes.append(proteina)
+                    logger.warning(
+                        f"Duplicados discordantes [{proteina}]: "
+                        f"{v_min:.1f} vs {v_max:.1f} → promedio, BAJA CONFIANZA"
+                    )
+            resultado[proteina] = round(float(np.mean(valores)), 3)
+        return resultado, discordantes
+
+    # ------------------------------------------------------------------
     def _muestrear_y_posiciones(
         self,
         strip_gris: np.ndarray,
@@ -2448,8 +3015,17 @@ class AnalizadorGrillaARY009:
         tr: Tuple,
         bl: Tuple,
         pbs_bot: Optional[Tuple] = None,
+        img_muestreo: Optional[np.ndarray] = None,
+        mask_sat: Optional[np.ndarray] = None,
     ):
         """
+        Las POSICIONES se calculan sobre strip_gris (8 bits, donde están
+        calibrados los detectores). Las INTENSIDADES se leen de img_muestreo
+        (16 bits si existe) y se expresan en escala 0-255 con decimales, para
+        no perder precisión sin cambiar los umbrales del resto del pipeline.
+        Deja en self._ultimas_alertas las proteínas con duplicados
+        discordantes y las que tienen píxeles saturados.
+
         Igual que muestrear_strip pero devuelve también (posiciones, r)
         para que el llamador pueda pasarlas a _debug_strip sin reejecutar
         el pipeline.
@@ -2458,19 +3034,360 @@ class AnalizadorGrillaARY009:
         h, w = strip_gris.shape
         posiciones, inv, r = self._calcular_posiciones_finales(
             strip_gris, tl, tr, bl, pbs_bot)
+        # El paso de fila acota la ventana del centroide (ver _centrado_fino).
+        # Se calcula igual que en _limitar_a_su_celda, desde tl/bl.
+        sep_y = abs(bl[1] - tl[1])
+        paso_fila = (sep_y / (self._FILA_REF_BOT - self._FILA_REF_TOP)
+                     if sep_y >= 1 else 0.0)
+        # `pos_float` recoge la posición subpixel del mean-shift para muestrear
+        # la intensidad sin el error del redondeo (ver el muestreo más abajo).
+        # Pasa por el cinturón de celda igual que la entera.
+        pos_float: Dict[Tuple[str, int], Tuple[float, float]] = {}
+        posiciones = self._centrado_fino(strip_gris, posiciones, r, paso_fila,
+                                         pos_float=pos_float)
+        posiciones = self._limitar_a_su_celda(posiciones, tl, tr, bl,
+                                              pos_float=pos_float)
 
+        inv_m = inv
+        if img_muestreo is not None and img_muestreo.shape == strip_gris.shape:
+            if img_muestreo.dtype == np.uint16:
+                claro16 = float(np.mean(img_muestreo)) > 65535 * 0.35
+                base16 = cv2.bitwise_not(img_muestreo) if claro16 else img_muestreo
+                inv_m = base16.astype(np.float32) / 256.0
+
+        # El parche de intensidad se toma con precisión SUBPIXEL, centrado en
+        # `pos_float` (el centroide exacto al que convergió el mean-shift) y no
+        # en la posición entera. Motivo: el recorte entero
+        # inv_m[py-r:py+r, px-r:px+r] lee la mancha desde una posición
+        # redondeada, y con r = 3-4 px y manchas de 2-3 px reales ese redondeo
+        # mete hasta 0.71 px de error en diagonal — del mismo orden que el
+        # residuo de centrado que todavía queda (mediana 0.117·r medida), o sea
+        # es una de las fuentes dominantes de error que sobreviven al ciclo 4.
+        # Golpea de lleno a la diferencia entre DUPLICADOS: los dos duplicados
+        # de una proteína son filas consecutivas, cada uno se redondea por su
+        # cuenta, y 1 px de diferencia entre los dos recortes alcanza para que
+        # lean distinto aunque la proteína sea la misma y las dos manchas
+        # idénticas. Medido sobre las 6 membranas: la mediana de la diferencia
+        # entre duplicados baja 6.90% -> 6.17% (-10.7% relativo).
+        #
+        # El centro se pide en (fx-0.5, fy-0.5) a propósito: `getRectSubPix`
+        # centra el parche en su centro GEOMÉTRICO, mientras que el recorte
+        # [px-r, px+r) de toda la vida está centrado en px-0.5. Pasar (fx, fy)
+        # "a secas" corre las 1656 ventanas medio píxel respecto de la
+        # convención con la que están calibrados los umbrales del pipeline
+        # (>8, >10, >15) y el fondo. Se midió: baja un poco más la diferencia
+        # entre duplicados (6.17% -> 5.95%) pero SUBE la contaminación de las
+        # celdas vacías en bloque (mediana 1.076 -> 1.148, media +0.103, p90
+        # 4.39 -> 4.54, y de 13 a 18 celdas vacías leyendo >10). Con el medio
+        # píxel compensado la distribución de las celdas vacías queda igual
+        # (mediana 1.076 idéntica, media -0.011, mismos recuentos >5 y >8).
+        # NO quitar el -0.5 sin recalibrar esos umbrales.
+        #
+        # `getRectSubPix` exige float32: en uint8 redondearía la interpolación
+        # bilineal a entero y volvería a perder justo el subpíxel que se busca.
+        # Si el parche no entra completo en el strip se cae al recorte entero de
+        # antes (getRectSubPix no puede interpolar fuera del borde). Medido:
+        # 1790 cuadros por la vía subpixel contra 4 por el borde (0.2%).
+        inv_sub = (inv_m if inv_m.dtype == np.float32
+                   else inv_m.astype(np.float32))
+        lado = 2 * r
         acum: Dict[str, List[float]] = {}
+        saturadas: List[str] = []
         for (col, fila), proteina in MAPA_PROTEINAS.items():
             px, py = posiciones[(col, fila)]
             x0, x1 = max(0, px - r), min(w, px + r)
             y0, y1 = max(0, py - r), min(h, py + r)
-            roi = inv[y0:y1, x0:x1]
-            if roi.size == 0:
-                continue
-            acum.setdefault(proteina, []).append(float(roi.mean()))
+            fx, fy = pos_float.get((col, fila), (float(px), float(py)))
+            if (r + 1 <= fx <= w - r - 1) and (r + 1 <= fy <= h - r - 1):
+                valor = float(cv2.getRectSubPix(
+                    inv_sub, (lado, lado), (fx - 0.5, fy - 0.5)).mean())
+            else:
+                roi = inv_m[y0:y1, x0:x1]
+                if roi.size == 0:
+                    continue
+                valor = float(roi.mean())
+            acum.setdefault(proteina, []).append(valor)
+            if (mask_sat is not None and mask_sat.shape == strip_gris.shape
+                    and mask_sat[y0:y1, x0:x1].any() and proteina not in saturadas):
+                saturadas.append(proteina)
 
-        intensidades = {p: round(float(np.mean(v)), 2) for p, v in acum.items()}
+        intensidades, discordantes = self._promediar_duplicados(acum)
+        intensidades = {k: round(v, 3) for k, v in intensidades.items()}
+        for prot in saturadas:
+            if prot == 'Reference':
+                logger.warning("Reference Spot SATURADO: la normalización de "
+                               "esta tirilla no es confiable.")
+            else:
+                logger.warning(f"Spot saturado [{prot}]: su intensidad real "
+                               f"puede ser mayor a la medida.")
+        self._ultimas_alertas = {'discordantes': discordantes,
+                                 'saturadas': saturadas}
         return intensidades, posiciones, r
+
+    def _limitar_a_su_celda(
+        self,
+        posiciones: Dict[Tuple[str, int], Tuple[int, int]],
+        tl: Tuple, tr: Tuple, bl: Tuple,
+        fraccion: float = 0.30,
+        pos_float: Optional[Dict[Tuple[str, int], Tuple[float, float]]] = None,
+    ) -> Dict[Tuple[str, int], Tuple[int, int]]:
+        """
+        Cinturón de seguridad: ningún cuadro puede quedar a más de `fraccion`
+        del paso de columna/fila respecto de su posición geométrica teórica.
+        Más allá de medio paso el cuadro está sobre la proteína VECINA: los
+        ajustes por spot (snap, ICP, centrado fino) lo atraen hacia una mancha
+        cercana cuando la proteína propia no se expresa, y entonces se mide la
+        señal de otra proteína. Este límite lo impide.
+
+        Si se pasa `pos_float` (las posiciones subpixel de `_centrado_fino`),
+        se recorta IN SITU con la misma caja. Tiene que recortarse: el
+        muestreo de intensidad usa el float, así que un float sin cinturón se
+        escaparía del límite que la posición entera sí respeta y volvería a
+        leer la proteína vecina por la puerta de atrás.
+        """
+        sep_x = abs(tr[0] - tl[0])
+        sep_y = abs(bl[1] - tl[1])
+        if sep_x < 1 or sep_y < 1:
+            return posiciones
+        paso_x = sep_x * min(abs(self._T_COLS['B'] - self._T_COLS['A']),
+                             abs(self._T_COLS['C'] - self._T_COLS['B']),
+                             abs(self._T_COLS['D'] - self._T_COLS['C']))
+        span = self._FILA_REF_BOT - self._FILA_REF_TOP
+        paso_y = sep_y / span
+        lim_x, lim_y = fraccion * paso_x, fraccion * paso_y
+        nuevas = {}
+        n_lim = 0
+        for (col, fila), (px, py) in posiciones.items():
+            t_row = (fila - self._FILA_REF_TOP) / span
+            x_a = tl[0] + t_row * (bl[0] - tl[0])
+            gx = x_a + self._T_COLS[col] * (tr[0] - tl[0])
+            gy = tl[1] + t_row * (bl[1] - tl[1])
+            nx = min(max(px, gx - lim_x), gx + lim_x)
+            ny = min(max(py, gy - lim_y), gy + lim_y)
+            if pos_float is not None and (col, fila) in pos_float:
+                fx, fy = pos_float[(col, fila)]
+                pos_float[(col, fila)] = (
+                    min(max(fx, gx - lim_x), gx + lim_x),
+                    min(max(fy, gy - lim_y), gy + lim_y))
+            nx, ny = int(round(nx)), int(round(ny))
+            if (nx, ny) != (px, py):
+                n_lim += 1
+            nuevas[(col, fila)] = (nx, ny)
+        if n_lim:
+            logger.info(f"Límite de celda: {n_lim} cuadros devueltos hacia su "
+                        f"posición (estaban sobre la proteína vecina).")
+        return nuevas
+
+    def _centrado_fino(
+        self,
+        strip_gris: np.ndarray,
+        posiciones: Dict[Tuple[str, int], Tuple[int, int]],
+        r: int,
+        paso_fila: float = 0.0,
+        pasadas: int = 3,
+        pos_float: Optional[Dict[Tuple[str, int], Tuple[float, float]]] = None,
+    ) -> Dict[Tuple[str, int], Tuple[int, int]]:
+        """
+        Último ajuste por cuadro: mueve cada cuadro al centroide de intensidad
+        de SU mancha. En imágenes ChemiDoc (348x260) cada spot mide 2-3 px
+        reales, así que 1 px de error deja el spot en el borde del cuadro y
+        subestima su intensidad (hasta -70 % medido en Sw620).
+
+        `paso_fila` es la separación entre filas en px; acota la ventana de
+        búsqueda del centroide (ver abajo). Si no se pasa, se mantiene el
+        comportamiento viejo.
+
+        Salvaguardas:
+          - Solo se mueve si hay una mancha con contraste claro (>= 12 en 8 bits).
+          - Desplazamiento máximo 2.0·r, solo como tope de la trayectoria del
+            mean-shift: el que impide saltar al spot vecino es la caja de
+            `_limitar_a_su_celda` (ver el techo más abajo).
+          - Solo se consideran píxeles >= 50 % del pico (ignora fondo y halos).
+        Los cuadros sin mancha (proteína no expresada) no se tocan.
+
+        `pasadas` es el número de iteraciones del mean-shift (ver el bucle).
+        Con 1 el comportamiento es el de una sola medición de centroide.
+
+        `pos_float` es un diccionario de SALIDA opcional: si se pasa, queda con
+        la posición FLOAT exacta a la que convergió el mean-shift de cada
+        cuadro, antes de redondear. Lo que se DEVUELVE sigue siendo entero
+        porque el Mapa Visual, `_debug_strip` y las métricas dibujan y miden
+        con enteros; pero el muestreo de intensidad necesita el float (ver
+        `_muestrear_y_posiciones`): redondear la posición antes de leer la
+        mancha mete hasta 0.71 px de error en diagonal, y con manchas de 2-3 px
+        reales eso es del mismo orden que el residuo de centrado que todavía
+        queda (0.117·r medido), o sea el redondeo ya es una de las fuentes
+        dominantes de error de intensidad.
+        """
+        if r is None or r < 1:
+            return posiciones
+        img = cv2.GaussianBlur(strip_gris, (3, 3), 0)
+        if img.dtype != np.uint8:
+            img = (img / 256).astype(np.uint8)
+        claro = float(np.mean(img)) > 255 * 0.35
+        señal = (255 - img.astype(np.float32)) if claro else img.astype(np.float32)
+        h, w = señal.shape
+        # Media-ventana de búsqueda del centroide. NO puede llegar a media fila:
+        # si llega, la ventana contiene también el spot de la fila vecina y el
+        # centroide cae en el punto medio entre las dos manchas en vez del centro
+        # de la propia. Con r = 0.40 del paso de fila (get_radio_dinamico), el
+        # viejo 1.6*r era 0.64 del paso: la ventana (lado 11-13 px) superaba el
+        # paso de fila (9.4-12.4 px) en las 6 membranas de prueba, SIEMPRE
+        # alcanzaba a la vecina. Por eso el centrado movía 1 de cada 3 cuadros y
+        # apenas bajaba el descentrado (29.9% -> 28.2%), empeorando la cola
+        # (p90 0.810 -> 0.926). Acotado a 0.40 del paso queda en 3-4 px, debajo
+        # de medio paso y por encima de la semi-extensión medida de una mancha
+        # (mediana 3 px, p90 4 px), así que la mancha propia entra completa y la
+        # vecina no. Medido: 25.0% -> 18.2% de cuadros descentrados, p90 0.621.
+        # La cota es el paso de FILA en los dos ejes aunque el paso de columna
+        # sea mayor: el cuadro de muestreo es cuadrado (px±r, py±r), así el
+        # centroide se mide sobre los mismos píxeles que después se promedian.
+        # Ensanchar la ventana en x hasta lo que permite el paso de columna se
+        # midió y empeora (19.5% de descentrados).
+        R = int(round(r * 1.6))
+        if paso_fila > 0:
+            R = max(2, min(R, int(paso_fila * 0.40)))
+        # Techo del desplazamiento. El 0.6·r viejo recortaba el 17.2% de los
+        # movimientos del centroide en las 6 membranas de prueba: el cuadro
+        # "apuntaba" al centro de su mancha pero se quedaba a mitad de camino,
+        # y ese resto de descentrado subestima la intensidad igual que si no se
+        # hubiera centrado. Subirlo a 1.0·r NO puede alcanzar la mancha vecina:
+        #   - la ventana del centroide quedó acotada en R = r (medido: R/r = 1.00
+        #     en las 23 tirillas), así que el centroide no puede pedir más de
+        #     ~1·r salvo en la diagonal (máximo medido 1.32·r);
+        #   - medio paso de fila son 1.41·r en el peor caso (mediana 1.55·r),
+        #     o sea el spot vecino queda fuera de alcance;
+        #   - y después corre `_limitar_a_su_celda`, cuyo ±0.30 del paso equivale
+        #     a 0.85-0.99·r: es un cinturón MÁS estrecho que este techo.
+        # Por eso al subirlo bajan las cinco métricas a la vez en vez de subir:
+        # descentrado 18.2% -> 16.0%, p90 0.621 -> 0.561, superpuestos 1 -> 0,
+        # dif. entre duplicados 8.0% -> 7.7%, sobre_vecina 0 -> 0.
+        #
+        # 1.0·r era el techo hasta que el mean-shift pasó a 3 pasadas, y ahí se
+        # volvió la compuerta que FRENA el centrado. Dos motivos medidos:
+        #   - el techo es un CÍRCULO de radio max_shift, pero `_limitar_a_su_celda`
+        #     es una CAJA de medios lados ±lim_x, ±lim_y (0.93-1.14·r y 0.85-0.99·r
+        #     en las 6 membranas). La diagonal de esa caja llega a 1.51·r, o sea
+        #     el círculo de 1.0·r le corta las ESQUINAS: un cuadro que necesita
+        #     moverse en diagonal queda topado por el techo aunque la caja (el
+        #     guardián con sentido geométrico) todavía se lo permita.
+        #   - el techo se aplica en cada pasada, así que además congela la ventana
+        #     del mean-shift fuera de la mancha y el cuadro ya no converge.
+        # Medido con 3 pasadas: el 13.9% de los cuadros con mancha quedaban
+        # topados, y eran el 59% de los que terminaban descentrados.
+        # Barrido del techo (descentrado / p90 del offset), cinturón intacto:
+        #   1.0 -> 11.5% / 0.435   1.2 -> 10.2% / 0.367   1.5 -> 9.8% / 0.345
+        #   1.6 ->  9.7% / 0.343   2.0 ->  9.6% / 0.342   3.0 y sin techo -> idem
+        # 2.0 es el punto de SATURACIÓN (2.0, 3.0 y sin techo dan las cinco
+        # métricas idénticas), así que no es un valor ajustado al dato: es
+        # simplemente "lo bastante grande para no ser el que manda", y cubre la
+        # diagonal máxima de la caja (1.51·r) con margen para la trayectoria.
+        # SUBIR ESTE TECHO NO PUEDE ACERCAR UN CUADRO A LA PROTEÍNA VECINA: el
+        # que fija el peor caso es la caja de `_limitar_a_su_celda`, que corre
+        # DESPUÉS y recorta toda posición final a ±0.30 del paso respecto de la
+        # geometría. Con eso, dos cuadros vecinos nunca quedan a menos de
+        # 0.40·paso (= 1.13-1.32·r) y ninguno puede pasar del 0.47·paso que
+        # dispara `sobre_vecina`, sea cual sea este techo. Medido: superpuestos
+        # 0 -> 0, sobre_vecina 0 -> 0, y los cuadros cuya celda está vacía en la
+        # posición geométrica y terminan leyendo señal (>10) bajan 14 -> 13, con
+        # la contaminación mediana de las celdas vacías igual (1.08).
+        # Para revertir: volver a `r * 1.0`.
+        max_shift = r * 2.0
+        nuevas: Dict[Tuple[str, int], Tuple[int, int]] = {}
+        n_mov = 0
+        n_pas = 0
+        for clave, (px, py) in posiciones.items():
+            # Mean-shift: el centroide se RECALCULA desde la posición ya
+            # corregida, no una sola vez desde la grilla. Motivo: la ventana
+            # está acotada en R = r (arriba) para no ver la mancha vecina, y
+            # una mancha más ANCHA que 2r entra recortada en esa ventana, con
+            # lo cual el centroide queda sesgado HACIA el centro viejo (sesgo
+            # de truncamiento): el cuadro apunta bien pero se queda corto.
+            # Medido en el ciclo 1: de los cuadros que EMPEORARON su offset,
+            # 28/28 ya estaban dentro de su propia celda, estaban sobre manchas
+            # fuertes y anchas (intensidad mediana 31.7 contra 20.7 de los que
+            # mejoraron) y se movieron hacia la geometría mientras el offset
+            # subía 0.29 -> 0.63; solo 5 de 28 topaban contra el cinturón de
+            # celda, así que el culpable era la ventana y no el cinturón.
+            # ENSANCHAR la ventana no sirve (se midió: acotar x por el paso de
+            # columna da 19.5% de descentrados contra 18.2%), porque alcanza a
+            # la vecina. Iterar sí: cada pasada centra más la ventana chica
+            # sobre la mancha propia, el recorte se vuelve simétrico y la
+            # ventana nunca llega a ver a la vecina.
+            # Medido con 1/2/3/5 pasadas (descentrado, dif. duplicados):
+            # 16.0%/7.7% -> 11.8%/6.9% -> 11.5%/6.8% -> 11.5%/6.8%. O sea
+            # SATURA en 3 (con 5 sale idéntico), y por eso el default es 3.
+            # El grupo que este cambio tenía que arreglar es el que más baja:
+            # manchas fuertes (intensidad > 25) 18.9% -> 12.1% de descentrados,
+            # p90 del offset 0.612 -> 0.432. Superpuestos y sobre_vecina siguen
+            # en 0 y las tirillas en 23/24. Con `pasadas=1` el resultado es
+            # exactamente el de una sola medición (verificado), así que bajarlo
+            # a 1 es la forma de revertir esto sin tocar el código.
+            cx, cy = float(px), float(py)
+            for _ in range(max(1, pasadas)):
+                ix, iy = int(round(cx)), int(round(cy))
+                x0, x1 = max(0, ix - R), min(w, ix + R + 1)
+                y0, y1 = max(0, iy - R), min(h, iy + R + 1)
+                roi = señal[y0:y1, x0:x1]
+                if roi.size == 0:
+                    break
+                roi = roi - np.percentile(roi, 40)
+                roi[roi < 0] = 0
+                pico = float(roi.max())
+                if pico < 12:
+                    break
+                roi[roi < 0.5 * pico] = 0
+                ys, xs = np.mgrid[y0:y1, x0:x1]
+                tot = float(roi.sum())
+                ncx = float((xs * roi).sum()) / tot
+                ncy = float((ys * roi).sum()) / tot
+                # El techo es ACUMULADO desde la posición de partida, no por
+                # pasada: si no, 3 pasadas de 1.0·r sumarían 3·r y el cuadro
+                # llegaría a la mancha vecina (medio paso de fila son 1.41·r
+                # en el peor caso).
+                tdx, tdy = ncx - px, ncy - py
+                td = (tdx * tdx + tdy * tdy) ** 0.5
+                if td > max_shift:
+                    ncx = px + tdx * max_shift / td
+                    ncy = py + tdy * max_shift / td
+                paso = ((ncx - cx) ** 2 + (ncy - cy) ** 2) ** 0.5
+                cx, cy = ncx, ncy
+                n_pas += 1
+                if paso < 0.1:
+                    break   # convergió: más pasadas no mueven nada
+            nx, ny = int(round(cx)), int(round(cy))
+            if (nx, ny) != (px, py):
+                n_mov += 1
+            nuevas[clave] = (nx, ny)
+            if pos_float is not None:
+                pos_float[clave] = (cx, cy)
+        # Anti-colapso: si el centrado deja dos cuadros encimados (ambos
+        # atraídos por la MISMA mancha), los dos vuelven a su posición de
+        # grilla. Medir dos proteínas sobre un mismo spot es peor que un
+        # cuadro ligeramente descentrado.
+        claves = list(nuevas.keys())
+        lim_sq = (1.2 * r) ** 2
+        revertir = set()
+        for i in range(len(claves)):
+            xi, yi = nuevas[claves[i]]
+            for j in range(i + 1, len(claves)):
+                xj, yj = nuevas[claves[j]]
+                if (xi - xj) ** 2 + (yi - yj) ** 2 < lim_sq:
+                    oi, oj = posiciones[claves[i]], posiciones[claves[j]]
+                    if (oi[0] - oj[0]) ** 2 + (oi[1] - oj[1]) ** 2 >= lim_sq:
+                        revertir.update((claves[i], claves[j]))
+        for c in revertir:
+            nuevas[c] = posiciones[c]
+            # El float vuelve junto con el entero: si no, el anti-colapso
+            # dejaría el cuadro dibujado en su posición de grilla pero midiendo
+            # todavía sobre la mancha compartida que disparó la colisión.
+            if pos_float is not None:
+                pos_float[c] = (float(posiciones[c][0]),
+                                float(posiciones[c][1]))
+        logger.info(f"Centrado fino: {n_mov}/{len(posiciones)} cuadros ajustados "
+                    f"({n_pas} pasadas de mean-shift), "
+                    f"{len(revertir)} revertidos por colisión.")
+        return nuevas
 
     def muestrear_strip(
         self,
@@ -2499,7 +3416,8 @@ class AnalizadorGrillaARY009:
                 continue
             acum.setdefault(proteina, []).append(float(roi.mean()))
 
-        return {p: round(float(np.mean(v)), 2) for p, v in acum.items()}
+        intensidades, _ = self._promediar_duplicados(acum)
+        return intensidades
 
     # ------------------------------------------------------------------
     def analizar_imagen(
@@ -2528,6 +3446,19 @@ class AnalizadorGrillaARY009:
         imagen_suave = cv2.GaussianBlur(gris_8, (3, 3), 0)
         strips = self.separar_strips(imagen_suave, n_strips)
 
+        if not strips:
+            raise ValueError(
+                f"No se detectaron tirillas en la imagen. "
+                f"Verifique que la imagen contenga {n_strips} membranas visibles "
+                f"(formato esperado: fondo claro, manchas oscuras, o imagen ChemiDoc)."
+            )
+
+        if len(strips) < n_strips:
+            logger.warning(
+                f"Solo se detectaron {len(strips)}/{n_strips} tirillas. "
+                f"El análisis continuará con las tirillas encontradas."
+            )
+
         debug_img = None
         if ruta_debug:
             debug_img = cv2.cvtColor(gris_8, cv2.COLOR_GRAY2BGR)
@@ -2538,8 +3469,16 @@ class AnalizadorGrillaARY009:
             # Recortar la versión original (16-bit si aplica) para esta tirilla.
             # Se guarda para permitir re-muestreo con referencias manuales.
             strip_orig = gris_orig[oy:oy + oh, ox:ox + ow]
+            strip_pos = gris_8[oy:oy + oh, ox:ox + ow]
+            mask_sat = getattr(self, '_mask_sat', None)
+            sat_strip = mask_sat[oy:oy + oh, ox:ox + ow] if mask_sat is not None else None
 
             refs = self.encontrar_referencias(strip_8)
+            # Una tirilla con anclajes imposibles se trata igual que una sin
+            # referencias: mejor no entregar intensidades que entregar números
+            # calculados sobre un grid que no corresponde a la membrana.
+            if refs is not None and not self._geometria_plausible(refs, i + 1):
+                refs = None
             if refs is None:
                 logger.warning(f"Strip {i+1}: sin referencias. Devolviendo intensidades vacías.")
                 resultados.append({})
@@ -2548,13 +3487,16 @@ class AnalizadorGrillaARY009:
                     'strip_orig': strip_orig.copy(),
                     'refs': None,
                     'offset': (ox, oy, ow, oh),
+                    'strip_pos': strip_pos.copy(),
+                    'mask_sat': sat_strip,
+                    'alertas': {'sin_referencias': True},
                 })
                 continue
 
             tl, tr, bl = refs
 
             intensidades, posiciones_debug, r_debug = self._muestrear_y_posiciones(
-                strip_orig, tl, tr, bl)
+                strip_pos, tl, tr, bl, img_muestreo=strip_orig, mask_sat=sat_strip)
             resultados.append(intensidades)
 
             if debug_img is not None:
@@ -2569,6 +3511,9 @@ class AnalizadorGrillaARY009:
                 'strip_orig': strip_orig.copy(),
                 'refs': (tl, tr, bl),
                 'offset': (ox, oy, ow, oh),
+                'strip_pos': strip_pos.copy(),
+                'mask_sat': sat_strip,
+                'alertas': dict(self._ultimas_alertas),
                 # Posiciones calculadas por el pipeline completo (cache para mapa visual)
                 'posiciones_cache': posiciones_debug,
                 'r_cache': r_debug,
@@ -2593,7 +3538,16 @@ class AnalizadorGrillaARY009:
         ext = os.path.splitext(ruta)[1].lower()
         wsi_exts = {'.scn', '.svs', '.ndpi', '.mrxs', '.vms', '.bif'}
 
-        if ext in wsi_exts:
+        # Los .scn de Bio-Rad ChemiDoc NO son WSI de Leica: openslide no los
+        # abre. Se leen con el lector propio, conservando los 16 bits.
+        es_biorad = False
+        if ext == '.scn':
+            with open(ruta, 'rb') as _f:
+                es_biorad = b'Image Lab' in _f.read(300)
+        if es_biorad:
+            from convertir_scn import leer_scn_biorad
+            img = leer_scn_biorad(ruta)
+        elif ext in wsi_exts:
             try:
                 import openslide
                 slide = openslide.OpenSlide(ruta)
@@ -2606,8 +3560,9 @@ class AnalizadorGrillaARY009:
             except ImportError:
                 raise ImportError("Instalar openslide-python para archivos WSI (.scn, .svs, etc.)")
 
-        # IMREAD_UNCHANGED preserva 16-bit y canales originales
-        img = cv2.imread(ruta, cv2.IMREAD_UNCHANGED)
+        else:
+            # IMREAD_UNCHANGED preserva 16-bit y canales originales
+            img = cv2.imread(ruta, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(f"No se pudo cargar: {ruta}")
 
@@ -2682,14 +3637,7 @@ class AnalizadorGrillaARY009:
                 # de los spots oscuros.
                 umbral_fondo = max(100, pico_claro - 15)
                 mask_fondo = gris_8 >= umbral_fondo
-                # Construir nueva imagen:
-                #   fondo (>=umbral) → 255 (blanco puro)
-                #   contenido (<umbral) → estirado a [0, 255]
-                resultado = np.full_like(gris_8, 255)
-                np.where(mask_fondo, 255,
-                         (gris_8.astype(np.float32) / umbral_fondo * 255).clip(0, 255).astype(np.uint8),
-                         out=resultado)
-                # Aplicar correctamente con cv2
+                # fondo (>=umbral) → 255 puro; contenido (<umbral) → estirado a [0, 255]
                 resultado = gris_8.astype(np.float32)
                 resultado = np.where(mask_fondo, 255.0,
                                       np.clip(resultado / umbral_fondo * 255, 0, 255))
@@ -2703,6 +3651,12 @@ class AnalizadorGrillaARY009:
                 gris_orig = gris_8.copy()
             else:
                 gris_orig = gris_8
+
+        # Píxeles saturados (o casi): en formato fondo claro el detector
+        # saturado queda en ~0. Un spot con estos píxeles subestima su
+        # intensidad real, y si es un Reference distorsiona TODA la tirilla.
+        umbral_sat = 256 if gris_orig.dtype == np.uint16 else 1
+        self._mask_sat = gris_orig <= umbral_sat
 
         return gris_orig, gris_8
 
@@ -2804,7 +3758,10 @@ class AnalizadorGrillaARY009:
             return None
 
         intensidades, posiciones, r = self._muestrear_y_posiciones(
-            sv['strip_orig'], tl, tr, bl, pbs_bot)
+            sv.get('strip_pos', sv['strip_orig']), tl, tr, bl, pbs_bot,
+            img_muestreo=sv['strip_orig'], mask_sat=sv.get('mask_sat'))
+        sv['alertas'] = dict(self._ultimas_alertas)
+        sv['alertas']['recalibrada_manual'] = True
         sv['refs'] = (tl, tr, bl, pbs_bot)
         # Actualizar cache para que el mapa visual use las nuevas posiciones
         sv['posiciones_cache'] = posiciones
@@ -2816,6 +3773,15 @@ class AnalizadorGrillaARY009:
             f"BL=({bl[0]:.0f},{bl[1]:.0f})"
         )
         return intensidades
+
+    # ------------------------------------------------------------------
+    def obtener_alertas(self) -> List[Dict]:
+        """
+        Alertas de calidad por tirilla, para mostrarlas en el reporte:
+          sin_referencias, discordantes (lista), saturadas (lista),
+          recalibrada_manual.
+        """
+        return [dict(sv.get('alertas', {})) for sv in self._strips_visual]
 
     # ------------------------------------------------------------------
     def obtener_datos_mapa_visual(self) -> list:
