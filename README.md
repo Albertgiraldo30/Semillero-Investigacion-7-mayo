@@ -11,16 +11,40 @@ Pipeline automatizado para el análisis cuantitativo de membranas del **Proteome
 
 ---
 
+## Novedades (octubre 2026)
+
+Ronda de mejoras enfocada en que los resultados sean **más precisos y más honestos**. Medido sobre las 6 membranas de prueba (24 tirillas):
+
+| Indicador | Antes | Ahora |
+|---|---|---|
+| Tirillas con datos | 16 / 24 | **23 / 24** |
+| Tirillas separadas correctamente | 21 / 24 | **24 / 24** |
+| Cuadros con mancha descentrados | 25 % | **10 %** |
+| Diferencia típica entre duplicados de una proteína | 7,8 % | **6,9 %** |
+| Cuadros midiendo la proteína vecina | >100 | **0** |
+
+**Cambios principales**
+
+- **Lectura directa de `.scn` (Bio-Rad ChemiDoc) en 16 bits.** Antes la conversión a PNG dividía entre 256 y se perdía precisión de intensidad; ahora `convertir_scn.py` conserva los 16 bits y el motor abre el `.scn` sin pasos manuales.
+- **Duplicados honestos.** Cuando los dos puntos de una proteína no coinciden, ya no se toma el mayor (sesgaba hacia arriba): se promedian, como indica el kit, y la proteína se marca como *baja confianza*.
+- **Alertas de saturación.** Se detectan los spots saturados del escáner; si el saturado es un Reference Spot, se avisa que la normalización de toda la tirilla no es confiable.
+- **Hoja "Alertas de calidad" en el Excel**, con una explicación simple de cada alerta.
+- **Separación de tirillas y anclaje corregidos** (recortes con ancho negativo y ancla inferior fuera del par de referencia).
+- **Centrado de cuadros:** centrado fino sobre cada mancha, protección contra cuadros encimados y un *límite de celda* que impide que un cuadro sin señal se desplace hasta la mancha de la proteína vecina.
+- **Pruebas automáticas** (`tests/`) para medir cada cambio con números y evitar retrocesos.
+
+---
+
 ## ¿Qué hace?
 
-1. **Carga** una imagen escaneada con 4 tirillas de membrana (PNG, TIFF, WSI).
+1. **Carga** una imagen escaneada con 4 tirillas de membrana: `.scn` de Bio-Rad ChemiDoc (recomendado, 16 bits), PNG, TIFF o WSI.
 2. **Separa** las tirillas automáticamente usando detección morfológica (Black-Hat + contraste).
 3. **Detecta** los Reference Spots para anclar una grilla geométrica de 5 columnas × 24 filas.
 4. **Muestrea** la intensidad en cada posición conocida del kit con radio adaptativo.
 5. **Cuantifica**: resta fondo PBS, normaliza por Reference Spots, promedia réplicas internas.
 6. **Calcula** Fold Change con propagación de error entre Control (tirillas 1-2) y Tratamiento (tirillas 3-4).
 7. **Interpreta** los resultados con un puntaje apoptótico y explicaciones en español accesibles.
-8. **Exporta** a Excel con tres hojas: Fold Change, Intensidades Brutas e Intensidades Normalizadas.
+8. **Exporta** a Excel con cuatro hojas: Fold Change, Intensidades Brutas, Intensidades Normalizadas y Alertas de calidad.
 
 ---
 
@@ -357,7 +381,11 @@ Score ≤ −5 → Resistencia / supervivencia dominante
 |---------|-----|
 | [interfaz.py](interfaz.py) | GUI principal (CustomTkinter + Matplotlib) |
 | [motor_apoptosis.py](motor_apoptosis.py) | Motor: detección, grilla, cuantificación, fold change |
-| [mapa_array.py](mapa_array.py) | Mapa oficial ARY009: proteínas ↔ coordenadas de grilla |
+| [mapa_array.py](mapa_array.py) | Mapa oficial ARY009: proteínas ↔ coordenadas de grilla y posición de columnas (`T_COLS`) |
+| [gridfit_ary009.py](gridfit_ary009.py) | Ajuste rígido de la grilla completa contra los spots detectados (último recurso de anclaje) |
+| [convertir_scn.py](convertir_scn.py) | Lector de `.scn` Bio-Rad en 16 bits y conversión a PNG de 16 bits |
+| [tests/regresion.py](tests/regresion.py) | Prueba de regresión: tirillas separadas y con datos en las 6 membranas |
+| [tests/metricas_centrado.py](tests/metricas_centrado.py) | Métricas de centrado: descentrados, encimados, proteína vecina, diferencia entre duplicados |
 | [utils_wsi.py](utils_wsi.py) | Utilidades para Whole Slide Images (OpenSlide) |
 | [etl_scn_converter.py](etl_scn_converter.py) | CLI de conversión masiva .SCN → TIFF/PNG |
 | [generar_mapa_ary009.py](generar_mapa_ary009.py) | Genera la imagen de referencia visual del kit |
@@ -374,7 +402,9 @@ Score ≤ −5 → Resistencia / supervivencia dominante
 pip install opencv-python numpy matplotlib customtkinter Pillow openpyxl
 ```
 
-**Opcional** (para archivos WSI de escáner: `.scn`, `.svs`, `.ndpi`):
+Los `.scn` de **Bio-Rad ChemiDoc** se leen sin dependencias adicionales.
+
+**Opcional** (solo para Whole Slide Images de microscopio: `.svs`, `.ndpi`, `.scn` de Leica):
 
 ```bash
 pip install openslide-python openslide-bin
@@ -388,7 +418,7 @@ python interfaz.py
 
 ### Pasos en la interfaz
 
-1. Click en **"Cargar imagen del escáner"** → selecciona el archivo PNG/TIFF de la membrana.
+1. Click en **"Cargar imagen del escáner"** → selecciona el archivo **`.scn` original** del ChemiDoc (recomendado) o un PNG/TIFF. Evita PNG exportados en 8 bits o de origen desconocido: pierden precisión y algunos están dañados.
 2. Click en **"Analizar Membranas"**.
 3. Revisa los resultados en las 4 pestañas:
    - **Reporte**: tabla numérica con valores individuales por tirilla y promedios.
@@ -402,13 +432,36 @@ python interfaz.py
 
 ## Salida Excel
 
-El archivo `.xlsx` generado contiene tres hojas:
+El archivo `.xlsx` generado contiene cuatro hojas:
 
 | Hoja | Contenido |
 |------|-----------|
 | **Fold Change** | Proteína, tipo, Control ± desv., Tratamiento ± desv., FC ± error, p aproximado, estado |
 | **Intensidades brutas** | Valor bruto por proteína para cada una de las 4 tirillas |
 | **Intensidades normalizadas** | Valor normalizado por proteína para cada una de las 4 tirillas |
+| **Alertas de calidad** | Por tirilla: referencias saturadas, spots saturados, duplicados discordantes (baja confianza), tirillas sin referencias o recalibradas a mano |
+
+---
+
+## Pruebas
+
+Desde la raíz del proyecto (con las imágenes `.scn` en `fotos/`):
+
+```bash
+python tests/regresion.py          # tirillas separadas y con datos
+python tests/metricas_centrado.py  # calidad del centrado de la grilla
+```
+
+Cualquier cambio al motor debe mantener o mejorar estas métricas.
+
+---
+
+## Limitaciones conocidas
+
+- **Resolución:** las imágenes del ChemiDoc miden 348×260 px; cada spot ocupa 2-3 píxeles reales, lo que limita la precisión del centrado. Exportar a mayor resolución (sin *binning*) mejoraría los resultados.
+- **Saturación:** en varias membranas de prueba los Reference Spots están saturados; esas tirillas se marcan en la hoja de alertas porque su normalización no es del todo confiable. Se recomiendan exposiciones más cortas.
+- **Membranas tenues:** C.mama-Cúrcuma tirilla 4 no se puede anclar (señal muy débil); se deja vacía en lugar de entregar datos falsos.
+- **Geometría del kit:** las posiciones de columna medidas en las membranas reales difieren ligeramente de `T_COLS` (B ≈ 0,25 vs 0,21; D ≈ 0,58 vs 0,64). Corregirlo es el siguiente paso pendiente.
 
 ---
 
